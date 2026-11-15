@@ -57,8 +57,10 @@ if (-not (Test-Path $TargetDir)) {
 
 # Copy every .ts and .json file from the repo root into the target.
 # This picks up local-context.ts and any future plugin files added here.
-$Files = Get-ChildItem -Path $PluginDir -Filter '*.ts' -File +
-         Get-ChildItem -Path $PluginDir -Filter '*.json' -File
+$Files = @(
+    Get-ChildItem -Path $PluginDir -Filter '*.ts' -File
+    Get-ChildItem -Path $PluginDir -Filter '*.json' -File
+)
 
 foreach ($File in $Files) {
     Copy-Item -Path $File.FullName -Destination $TargetDir -Force
