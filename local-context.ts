@@ -6,7 +6,9 @@ import path from "path";
 
 // === HELPERS: Config ===
 
-const PROTECTED_TOKENS = +(process.env.OPENCODE_CTX_PROTECTED_TOKENS || 16000);
+// Keep the most recent user input plus the trailing context window (default 32K tokens).
+// Override via OPENCODE_CTX_PROTECTED_TOKENS (bytes → tokens? keep same unit as default).
+const PROTECTED_TOKENS = +(process.env.OPENCODE_CTX_PROTECTED_TOKENS || 32000);
 const CAP_CHARS = +(process.env.OPENCODE_CTX_CAP_CHARS || 9000);
 const AGE_BATCH = +(process.env.OPENCODE_CTX_AGE_BATCH || 10);
 const ONELINER_KEEP = +(process.env.OPENCODE_CTX_ONELINER_KEEP || 6);
@@ -576,13 +578,28 @@ export default {
           if (i === 0) tailStart = 0;
         }
 
-        // Fold: everything older than tail (excluding first user message) goes to chunk
+        // Fold: everything older than the tail goes to a chunk - but NEVER the leading
+        // system messages (the system prompt is not part of the foldable history) and
+        // NEVER the first user message (it is the original task anchor).
         const stepLogMarker = "[CONTEXT STEP LOG]";
         const chunkN = Number(state.chunkCount ?? 0);
         const foldedTexts: string[] = [];
 
-        for (let i = 1; i < tailStart; i++) {
-          const msgText = extractMessageText(ev.messages[i]);
+        // Locate the first user message (the task anchor) to keep it out of the fold.
+        let firstUserIdx = -1;
+        for (let i = 0; i < ev.messages.length; i++) {
+          if (ev.messages[i] && ev.messages[i].role === "user") {
+            firstUserIdx = i;
+            break;
+          }
+        }
+
+        for (let i = 0; i < tailStart; i++) {
+          const msg = ev.messages[i];
+          if (!msg) continue;
+          if (msg.role === "system") continue; // system prompt is never folded/cut
+          if (i === firstUserIdx) continue; // task anchor is never folded/cut
+          const msgText = extractMessageText(msg);
           if (msgText) {
             foldedTexts.push(msgText);
           }
@@ -610,11 +627,17 @@ export default {
           state.chunkCount = chunkN + 1;
         }
 
-        // Remove folded messages from ev.messages (keep first user + protected tail)
+        // Remove folded messages from ev.messages (keep system messages, first user, protected tail)
         const newMessages: any[] = [];
-        // Keep first user message
-        if (ev.messages[0] && ev.messages[0].role === "user") {
-          newMessages.push(ev.messages[0]);
+        // Keep every leading system message (the system prompt is never cut).
+        for (let i = 0; i < tailStart; i++) {
+          if (ev.messages[i] && ev.messages[i].role === "system") {
+            newMessages.push(ev.messages[i]);
+          }
+        }
+        // Keep the first user message (the task anchor).
+        if (firstUserIdx >= 0 && firstUserIdx < tailStart) {
+          newMessages.push(ev.messages[firstUserIdx]);
         }
 
         // Insert step-log user message right after first user message
@@ -1093,9 +1116,24 @@ export default {
               return "Could not determine session ID.";
             }
 
-            const text = invocation.text;
-            if (!text || !text.trim()) {
-              return "Task text cannot be empty.";
+            // The task text may arrive in different shapes across opencode
+            // versions: a plain `text` field, an `args` object, or a `task`
+            // field. Accept every shape so the command works regardless.
+            let text: string | null = null;
+            if (typeof invocation.text === "string" && invocation.text.trim()) {
+              text = invocation.text.trim();
+            } else if (invocation.args && typeof invocation.args.task === "string") {
+              text = invocation.args.task.trim();
+            } else if (invocation.args && typeof invocation.args.text === "string") {
+              text = invocation.args.text.trim();
+            } else if (typeof invocation.task === "string" && invocation.task.trim()) {
+              text = invocation.task.trim();
+            } else if (typeof invocation === "string" && invocation.trim()) {
+              text = invocation.trim();
+            }
+
+            if (!text) {
+              return "Task text cannot be empty. Usage: /add-task <the task description>";
             }
 
             await registerSession(ctx, sessionID);
@@ -1449,7 +1487,7 @@ export default {
           } else if (path === "/api/local-context/config") {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
-              PROTECTED_TOKENS: +(process.env.OPENCODE_CTX_PROTECTED_TOKENS || 16000),
+              PROTECTED_TOKENS: +(process.env.OPENCODE_CTX_PROTECTED_TOKENS || 32000),
               CAP_CHARS: +(process.env.OPENCODE_CTX_CAP_CHARS || 9000),
               AGE_BATCH: +(process.env.OPENCODE_CTX_AGE_BATCH || 10),
               ONELINER_KEEP: +(process.env.OPENCODE_CTX_ONELINER_KEEP || 6),
