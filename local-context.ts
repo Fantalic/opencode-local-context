@@ -3,11 +3,13 @@
 
 import type { Plugin } from "@opencode/plugin";
 import path from "path";
+import fs from "node:fs";
+import http from "node:http";
 
 // === HELPERS: Config ===
 
 // Keep the most recent user input plus the trailing context window (default 32K tokens).
-// Override via OPENCODE_CTX_PROTECTED_TOKENS (bytes → tokens? keep same unit as default).
+// Override via OPENCODE_CTX_PROTECTED_TOKENS (bytes -> tokens? keep same unit as default).
 const PROTECTED_TOKENS = +(process.env.OPENCODE_CTX_PROTECTED_TOKENS || 32000);
 const CAP_CHARS = +(process.env.OPENCODE_CTX_CAP_CHARS || 9000);
 const AGE_BATCH = +(process.env.OPENCODE_CTX_AGE_BATCH || 10);
@@ -16,6 +18,10 @@ const LOOKUP_TIMEOUT_MS = +(process.env.OPENCODE_CTX_LOOKUP_TIMEOUT_MS || 60000)
 const POLY_URL = process.env.OPENCODE_CTX_POLY_URL || "http://127.0.0.1:8095";
 const POLY_MODEL = process.env.OPENCODE_CTX_POLY_MODEL || "qwen3.6-35b-a3b-ud-q3_k_m";
 const CHUNK_MAX_CHARS = 40000;
+
+// Hard-compress threshold for stateless sessions (sub-agents, plain sessions).
+// Override via OPENCODE_CTX_HARD_COMPRESS_TOKENS (tokens). Default 64000.
+const HARD_COMPRESS_TOKENS = +(process.env.OPENCODE_CTX_HARD_COMPRESS_TOKENS || 64000);
 
 const rootSessionCache = new Map<string, string>();
 
@@ -95,14 +101,18 @@ function stripAnsi(s: string): string {
 // === HELPERS: Checklist render ===
 
 function renderChecklist(
-  todo: { text: string; done: boolean; reason?: string }[],
+  todo: { text: string; goal?: string; done: boolean; completionStory?: string }[],
 ): string {
   const lines: string[] = [];
   for (let i = 0; i < todo.length; i++) {
     const mark = todo[i].done ? "[x]" : "[ ]";
     lines.push(`${mark} ${i + 1}. ${todo[i].text}`);
-    if (todo[i].done && todo[i].reason) {
-      lines.push(`    Reason: ${todo[i].reason}`);
+    if (todo[i].done) {
+      const story = todo[i].completionStory || "";
+      const short = story.length > 400 ? story.slice(0, 400) + " ... (full story via todo_lookup)" : story;
+      if (short) lines.push(`    Story: ${short}`);
+    } else if (todo[i].goal) {
+      lines.push(`    Goal: ${todo[i].goal}`);
     }
   }
   return lines.join("\n");
@@ -114,9 +124,9 @@ function sideLog(component: string, line: string): void {
   try {
     const ts = new Date().toISOString();
     const msg = `${ts} ${component} ${line}\n`;
-    const logDir = require("node:path").dirname(SIDE_LOG);
-    require("node:fs").mkdirSync(logDir, { recursive: true });
-    require("node:fs").appendFileSync(SIDE_LOG, msg, "utf8");
+    const logDir = path.dirname(SIDE_LOG);
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(SIDE_LOG, msg, "utf8");
   } catch {
     // side log must never break the plugin
   }
@@ -172,7 +182,7 @@ async function saveChunk(ctx: any, sessionID: string, n: number, text: string): 
 
 async function removeChunk(ctx: any, sessionID: string, n: number): Promise<void> {
   try {
-    await ctx.storage.delete(chunkKey(sessionID, n));
+    await storageRemove(ctx, chunkKey(sessionID, n));
   } catch {
     // fail-open
   }
@@ -180,10 +190,24 @@ async function removeChunk(ctx: any, sessionID: string, n: number): Promise<void
 
 async function removeState(ctx: any, sessionID: string): Promise<void> {
   try {
-    await ctx.storage.delete(stateKey(sessionID));
+    await storageRemove(ctx, stateKey(sessionID));
   } catch {
     // fail-open
   }
+}
+
+// Storage API drift defense: the documented method is `remove`; some builds
+// only expose `delete`. Try `remove` first, fall back to `delete`.
+async function storageRemove(ctx: any, key: string): Promise<void> {
+  try {
+    if (typeof ctx.storage.remove === "function") {
+      await ctx.storage.remove(key);
+      return;
+    }
+  } catch { /* fall through */ }
+  try {
+    await ctx.storage.delete(key);
+  } catch { /* fail-open */ }
 }
 
 async function initSessionRegistry(ctx: any): Promise<string[]> {
@@ -235,9 +259,16 @@ async function wipeSession(ctx: any, sessionID: string): Promise<void> {
       const ck = chunkKey(sessionID, n);
       const val = await ctx.storage.get(ck);
       if (val === undefined) break;
-      await ctx.storage.delete(ck);
+      await storageRemove(ctx, ck);
       n++;
     }
+    // Legacy per-session persist keys (lc:persist:<sid>) are junk now.
+    try {
+      const page = await ctx.storage.scan({ prefix: `lc:persist:${sessionID}`, limit: 1000 });
+      for (const entry of page?.entries || []) {
+        await storageRemove(ctx, entry.key);
+      }
+    } catch { /* fail-open */ }
     // Remove state
     await removeState(ctx, sessionID);
     // Unregister
@@ -253,46 +284,62 @@ async function wipeAllSessions(ctx: any): Promise<void> {
     for (const sid of sessions) {
       await wipeSession(ctx, sid);
     }
-    await ctx.storage.delete("lc:sessions");
+    await storageRemove(ctx, "lc:sessions");
   } catch {
     // fail-open
   }
 }
 
-// === HELPERS: Persist state to disk ===
+// === HELPERS: Completion report (the durable record of a finished todo list) ===
 
+// Written when ALL tasks are done, right before the heavy session data
+// (chunks, index, state) is wiped. todo_lookup serves this afterwards.
 const PERSIST_DIR =
   "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-persist";
 
-function persistState(sessionID: string) {
-  try {
-    if (!state.todo || state.todo.length === 0) return;
-    const filePath = path.join(PERSIST_DIR, `${sessionID}.json`);
-    const data = JSON.stringify(
-      { todo: state.todo, log: state.log, index: state.index },
-      null,
-      2,
-    );
-    ctx.storage.put(`lc:persist:${sessionID}`, data);
-  } catch {
-    /* fail-open */
-  }
+function reportKey(sessionID: string): string {
+  return `lc:report:${sessionID}`;
 }
 
-function loadPersistedState(sessionID: string) {
+async function saveCompletionReport(ctx: any, sessionID: string, state: any): Promise<void> {
   try {
-    const data = ctx.storage.get(`lc:persist:${sessionID}`);
-    if (data) {
-      const parsed = JSON.parse(data);
-      if (parsed.todo && parsed.todo.length > 0) {
-        state.todo = parsed.todo;
-        state.log = parsed.log || [];
-        state.index = parsed.index || [];
-      }
+    const report = {
+      sessionID,
+      sessionLabel: state.sessionLabel || "",
+      originalTask: state.originalTask || "",
+      completedAt: new Date().toISOString(),
+      tasks: (state.todo || []).map((t: any) => ({
+        text: t.text,
+        goal: t.goal || "",
+        done: t.done === true,
+        completionStory: t.completionStory || "",
+        doneAt: t.doneAt || "",
+      })),
+    };
+    const data = JSON.stringify(report, null, 2);
+    await ctx.storage.set(reportKey(sessionID), data);
+    // Disk copy: survives storage resets, easy to find manually.
+    try {
+      fs.mkdirSync(PERSIST_DIR, { recursive: true });
+      fs.writeFileSync(path.join(PERSIST_DIR, `${sessionID}.report.json`), data, "utf8");
+    } catch { /* fail-open */ }
+    sideLog("report", `saved report for ${sessionID} (${report.tasks.length} tasks)`);
+  } catch { /* fail-open */ }
+}
+
+async function loadCompletionReport(ctx: any, sessionID: string): Promise<any | null> {
+  try {
+    let raw: any = await ctx.storage.get(reportKey(sessionID));
+    if (!raw) {
+      try {
+        const p = path.join(PERSIST_DIR, `${sessionID}.report.json`);
+        if (fs.existsSync(p)) raw = fs.readFileSync(p, "utf8");
+      } catch { /* fall through */ }
     }
-  } catch {
-    /* fail-open */
-  }
+    if (!raw) return null;
+    if (typeof raw === "string") return JSON.parse(raw);
+    return raw;
+  } catch { return null; }
 }
 
 async function resolveRootSession(ctx: any, sessionID: string): Promise<string | null> {
@@ -329,7 +376,7 @@ export default {
       reg.add({
         name: "todo",
         description:
-          'Plan a task and mark its steps done as you complete them. action "plan": pass items as the array of step descriptions (strings). action "done": pass items as the array of 1-based step numbers (numbers or numeric strings) that are now complete.',
+          "Plan a task and mark its steps done as you complete them. action=done ONLY when the step's work is completely finished AND verified - never for work that is merely started, underway, or delegated and still pending. plan: items are {\"text\": \"what to do\", \"goal\": \"the outcome that defines done\"}. done: 1-based step numbers + completionStory (past tense: HOW the goal was reached; min 30 chars). Do not plan trivial single actions (e.g. a single file read or lookup) as steps; steps should be units of real work worth compressing - grouping related reads into one step is fine.",
         input: {
           type: "object" as const,
           properties: {
@@ -339,16 +386,38 @@ export default {
             },
             items: {
               type: "array" as const,
-              items: { type: ["string", "number"] as const },
+              description:
+                "action=plan only: array of task objects {\"text\": \"what to do\", \"goal\": \"the outcome that defines done\"}. Both fields required, non-empty.",
+              items: {
+                type: "object",
+                properties: {
+                  text: { type: "string" },
+                  goal: { type: "string" },
+                },
+                required: ["text", "goal"],
+                additionalProperties: false,
+              },
             },
             done: {
               type: "array" as const,
               items: { type: ["string", "number"] as const },
+              description:
+                "action=done only: 1-based step numbers that are now COMPLETE (work finished and verified).",
+            },
+            completionStory: {
+              type: "string" as const,
+              description:
+                "Required for action=done. Past-tense narrative of HOW the goal was reached: what was done, what was produced, what was verified. At least 30 characters.",
             },
             reason: {
               type: "string" as const,
               description:
-                "Required for action=done. 1-3 sentences explaining what was accomplished (or why nothing was needed).",
+                "Deprecated alias of completionStory; accepted for compatibility.",
+            },
+            confirm: {
+              type: "boolean" as const,
+              description:
+                "Set true ONLY if a completionStory rejection was a false positive and the work really is complete and verified.",
             },
           },
           required: ["action"],
@@ -385,28 +454,49 @@ export default {
 
             if (params.action === "plan") {
               const items = params.items || [];
-              state.todo = items.map((t: any) => ({ text: String(t), done: false }));
+              for (const item of items) {
+                if (!item || typeof item !== "object" || !item.text || !String(item.text).trim() || !item.goal || !String(item.goal).trim()) {
+                  return {
+                    content:
+                      'Invalid arguments for tool "todo": each plan item must be an object {"text": "...", "goal": "..."}. text = what to do; goal = the outcome that defines done (used later to judge completion). Offending item: ' +
+                      JSON.stringify(item),
+                  };
+                }
+              }
+              state.todo = items.map((t: any) => ({ text: String(t.text).trim(), goal: String(t.goal).trim(), done: false }));
               state.folded = false;
               await saveState(ctx, sessionID, state);
               sideLog("todo", `planned ${items.length} tasks`);
-              return { content: renderChecklist(state.todo) };
+              return { content: renderChecklist(state.todo) + "\n\nReminder: done = work COMPLETE and verified." };
             }
 
             if (params.action === "done") {
-              // Validate reason for done action
-              if (!params.reason || !params.reason.trim()) {
+              // a) completionStory validation
+              const story = String(params.completionStory ?? params.reason ?? "").trim();
+              if (!story) {
                 return {
                   content:
-                    "Invalid arguments for tool \"todo\": reason is required for action=done. Provide 1-3 sentences explaining what was accomplished (or why nothing was needed).",
+                    'Invalid arguments for tool "todo": completionStory is required for action=done. Describe in past tense HOW the goal was reached (what you did, what was produced, what was verified).',
                 };
               }
-              if (params.reason.trim().length < 10) {
+              if (story.length < 30) {
                 return {
                   content:
-                    "Invalid arguments for tool \"todo\": reason must be at least 10 characters. Provide a brief explanation of what was accomplished.",
+                    'Invalid arguments for tool "todo": completionStory must be at least 30 characters. Tell HOW the goal was reached: what was done, what was produced, what was verified.',
                 };
               }
 
+              // b) Phrase guard
+              const IN_PROGRESS_RE = /\b(underway|in progress|starting to|starting|started working|delegating|delegated and (?:still )?(?:awaiting|pending)|about to|will now|let me|going to|currently working|not yet|kicking off|beginning|planning to|working on it|in flight)\b/i;
+              const inProgressMatch = IN_PROGRESS_RE.exec(story);
+              if (inProgressMatch && params.confirm !== true) {
+                return {
+                  content:
+                    'REJECTED: this does not read like completed work (matched phrase: "' + inProgressMatch[0] + '"). A step is done ONLY when its work is completely finished AND verified. If the work really IS complete and your story merely contains this phrase, rewrite the story in past tense with concrete results and re-call with confirm: true.',
+                };
+              }
+
+              // c) Step numbers
               const rawIdx = [
                 ...(params.done ?? []),
                 ...(params.items ?? []),
@@ -418,9 +508,42 @@ export default {
                   validIdx.add(n);
                 }
               }
-              if (rawIdx.length > 0 && validIdx.size === 0) {
-                sideLog("todo", "WARN: unparseable done indexes");
+              if (rawIdx.length === 0) {
+                return {
+                  content:
+                    'ERROR: no steps were marked done. You must pass the 1-based step numbers in the `done` (or `items`) array.\n\nOpen steps:\n' +
+                    renderChecklist(state.todo.filter(function (t) { return !t.done; })) +
+                    '\n\nRule: only mark a step done when its work is completely finished and verified.',
+                };
               }
+              if (rawIdx.length > 0 && validIdx.size === 0) {
+                return {
+                  content:
+                    'No valid step numbers in range 1-' + state.todo.length + '. Received: ' + JSON.stringify(rawIdx) + '.\n\nOpen steps:\n' +
+                    renderChecklist(state.todo.filter(function (t) { return !t.done; })),
+                };
+              }
+
+              // d) Strict order: step N may only be done when all earlier
+              // steps are done. Escape hatch: confirm: true for the rare
+              // legitimate out-of-order case (e.g. a sub-agent finished a
+              // later step early).
+              const maxIdx = Math.max(...[...validIdx]);
+              const earlierOpen = [];
+              for (let i = 0; i < maxIdx - 1; i++) {
+                const stepNum = i + 1;
+                if (state.todo[i] && !state.todo[i].done && !validIdx.has(stepNum)) earlierOpen.push(stepNum);
+              }
+              if (earlierOpen.length > 0 && params.confirm !== true) {
+                return {
+                  content:
+                    "REJECTED: strict step order - step(s) " + earlierOpen.join(", ") +
+                    " must be done before step " + maxIdx + " can be marked done. Complete them first" +
+                    " (in order), or if this out-of-order completion is genuinely intentional, re-call with confirm: true.",
+                };
+              }
+
+              // e) Mark tasks done
               for (const idx of validIdx) {
                 const zeroBased = idx - 1;
                 if (!state.todo[zeroBased].done) {
@@ -433,20 +556,30 @@ export default {
                   state.log.push({
                     t: hhmm,
                     text: state.todo[zeroBased].text,
-                    reason: params.reason.trim(),
+                    completionStory: story,
                     keywords: extractKeywords(state.todo[zeroBased].text),
                   });
+                  state.todo[zeroBased].completionStory = story;
+                  state.todo[zeroBased].doneAt = hhmm;
                   state.pendingFold = true;
                   sideLog("todo", `marked #${idx} done`);
                 }
               }
               await saveState(ctx, sessionID, state);
               sideLog("todo", `saved state, pendingFold=${state.pendingFold}`);
-              let result = renderChecklist(state.todo);
-              if (validIdx.size === 0) {
-                result = "No valid step numbers given.\n" + result;
+
+              // All tasks complete: persist the completion report, then wipe
+              // the heavy session data so finished sessions do not junk storage.
+              let cleanupNote = "";
+              if (state.todo.length > 0 && state.todo.every((t: any) => t.done)) {
+                await saveCompletionReport(ctx, sessionID, state);
+                await wipeSession(ctx, sessionID);
+                cleanupNote = "\n\n[All tasks complete. Session data wiped; completion report saved (fetch via todo_lookup).]";
+                sideLog("cleanup", `all tasks done, wiped session ${sessionID}`);
               }
-              return { content: result };
+
+              // f) Success output
+              return { content: renderChecklist(state.todo) + cleanupNote };
             }
 
             return { content: "Unknown action. Use 'plan' or 'done'." };
@@ -468,6 +601,54 @@ export default {
 
         const state = await loadState(ctx, sessionID);
 
+        // Pending tasks (one-shot): works even before the first fold.
+        if (state?.pendingTaskCount > 0) {
+          const stepLogMarker = "[CONTEXT STEP LOG]";
+          let stepLogIdx = -1;
+          for (let i = 0; i < ev.messages.length; i++) {
+            const txt = extractMessageText(ev.messages[i]);
+            if (txt.startsWith(stepLogMarker)) {
+              stepLogIdx = i;
+              break;
+            }
+          }
+          if (stepLogIdx >= 0) {
+            const logTexts: string[] = [];
+            for (const entry of state.log) {
+              let line = `[${entry.t}] ${entry.text}`;
+              if (entry.completionStory) {
+                line += `\n    Story: ${entry.completionStory}`;
+              }
+              logTexts.push(line);
+            }
+            let logBody = logTexts.join("\n");
+            if (state.summaries.length > 0) {
+              logBody += "\n\n[SUMMARIES]\n" + state.summaries.map((s: any) => s.text).join("\n\n");
+            }
+            logBody += "\n\n[PENDING TASKS]\n";
+            for (let i = 0; i < state.todo.length; i++) {
+              const mark = state.todo[i].done ? "[x]" : "[ ]";
+              logBody += `${mark} ${i + 1}. ${state.todo[i].text}\n`;
+              const logEntry = state.log.find(
+                (e: any) => e.text === state.todo[i].text,
+              );
+              if (logEntry && (logEntry.completionStory || logEntry.reason)) {
+                logBody += `    Story: ${logEntry.completionStory || logEntry.reason}\n`;
+              }
+            }
+            ev.messages[stepLogIdx].content = [
+              { type: "text", text: stepLogMarker + "\n\n" + logBody },
+            ];
+          }
+          // pendingTaskCount is a one-shot trigger: show the pending tasks in
+          // the step log this turn, then clear it so normal folding resumes on
+          // the next turn. (Bug fix: it used to stick forever, which silently
+          // disabled all compression after any /add-task.)
+          state.pendingTaskCount = 0;
+          await saveState(ctx, sessionID, state);
+          return;
+        }
+
         // If no state (no todo tool use) OR no pendingFold AND not folded, do nothing
         if (!state || (!state.pendingFold && !state.folded)) {
           // If state exists and folded is true but pendingFold is false,
@@ -487,8 +668,8 @@ export default {
               const logTexts: string[] = [];
               for (const entry of state.log) {
                 let line = `[${entry.t}] ${entry.text}`;
-                if (entry.reason) {
-                  line += `\n    Reason: ${entry.reason}`;
+                if (entry.completionStory) {
+                  line += `\n    Story: ${entry.completionStory}`;
                 }
                 logTexts.push(line);
               }
@@ -499,48 +680,6 @@ export default {
               ev.messages[stepLogIdx].content = [{ type: "text", text: stepLogMarker + "\n\n" + logBody }];
             }
             return;
-          }
-          return;
-        }
-
-        // Check for pending tasks added via /add-task
-        if (state.pendingTaskCount > 0) {
-          const stepLogMarker = "[CONTEXT STEP LOG]";
-          let stepLogIdx = -1;
-          for (let i = 0; i < ev.messages.length; i++) {
-            const txt = extractMessageText(ev.messages[i]);
-            if (txt.startsWith(stepLogMarker)) {
-              stepLogIdx = i;
-              break;
-            }
-          }
-          if (stepLogIdx >= 0) {
-            const logTexts: string[] = [];
-            for (const entry of state.log) {
-              let line = `[${entry.t}] ${entry.text}`;
-              if (entry.reason) {
-                line += `\n    Reason: ${entry.reason}`;
-              }
-              logTexts.push(line);
-            }
-            let logBody = logTexts.join("\n");
-            if (state.summaries.length > 0) {
-              logBody += "\n\n[SUMMARIES]\n" + state.summaries.map((s: any) => s.text).join("\n\n");
-            }
-            logBody += "\n\n[PENDING TASKS]\n";
-            for (let i = 0; i < state.todo.length; i++) {
-              const mark = state.todo[i].done ? "[x]" : "[ ]";
-              logBody += `${mark} ${i + 1}. ${state.todo[i].text}\n`;
-              const logEntry = state.log.find(
-                (e: any) => e.text === state.todo[i].text,
-              );
-              if (logEntry && logEntry.reason) {
-                logBody += `    Instructions: ${logEntry.reason}\n`;
-              }
-            }
-            ev.messages[stepLogIdx].content = [
-              { type: "text", text: stepLogMarker + "\n\n" + logBody },
-            ];
           }
           return;
         }
@@ -656,8 +795,8 @@ export default {
           const logTexts: string[] = [];
           for (const entry of state.log) {
             let line = `[${entry.t}] ${entry.text}`;
-            if (entry.reason) {
-              line += `\n    Reason: ${entry.reason}`;
+            if (entry.completionStory) {
+              line += `\n    Story: ${entry.completionStory}`;
             }
             logTexts.push(line);
           }
@@ -673,8 +812,8 @@ export default {
           const logTexts: string[] = [];
           for (const entry of state.log) {
             let line = `[${entry.t}] ${entry.text}`;
-            if (entry.reason) {
-              line += `\n    Reason: ${entry.reason}`;
+            if (entry.completionStory) {
+              line += `\n    Story: ${entry.completionStory}`;
             }
             logTexts.push(line);
           }
@@ -920,44 +1059,80 @@ export default {
       reg.add({
         name: "todo_lookup",
         description:
-          "Look up persisted todo tasks and their instructions",
+          "Look up persisted todo tasks with goals and completion stories. Works even after the session data was wiped (serves the persisted completion report) and falls back to the root session so sub-agents and parent agents can both check what was done.",
         input: {
           type: "object" as const,
           properties: {
             sessionID: {
               type: "string" as const,
-              description: "Session ID to look up",
+              description:
+                "Optional. Defaults to the current session; falls back to the root session.",
             },
           },
-          required: ["sessionID"],
+          required: [],
           additionalProperties: false,
         },
         options: { codemode: false },
         execute: async (params: any, context: any) => {
           try {
-            const sessionID = params.sessionID;
-            const state = await loadState(ctx, sessionID);
-            if (!state || !state.todo || state.todo.length === 0) {
+            const sid = params.sessionID || context?.sessionID || "default";
+
+            // Render tasks compactly: status, goal (open tasks), story (done tasks).
+            const fmtTasks = (tasks: any[], log: any[]): string[] => {
+              const lines: string[] = [];
+              for (let i = 0; i < tasks.length; i++) {
+                const t = tasks[i];
+                lines.push(`Task ${i + 1}: ${t.text} [${t.done ? "done" : "open"}]`);
+                if (!t.done && t.goal) lines.push(`  Goal: ${t.goal}`);
+                const story = t.completionStory
+                  || (log.find((e: any) => e.text === t.text) || {}).completionStory
+                  || "";
+                if (story) {
+                  const short = story.length > 400
+                    ? story.slice(0, 400) + " ..."
+                    : story;
+                  lines.push(`  Story: ${short}`);
+                }
+              }
+              return lines;
+            };
+
+            let state: any = await loadState(ctx, sid);
+            if (!state?.todo?.length) state = null;
+            let report: any = state ? null : await loadCompletionReport(ctx, sid);
+
+            // Sub-agent case: no data here - try the root session.
+            if (!state && !report) {
+              const rootID = await resolveRootSession(ctx, sid);
+              if (rootID && rootID !== sid) {
+                const rootState = await loadState(ctx, rootID);
+                if (rootState?.todo?.length) {
+                  state = rootState;
+                  sideLog("todo_lookup", `serving root session ${rootID}`);
+                } else {
+                  report = await loadCompletionReport(ctx, rootID);
+                  if (report) sideLog("todo_lookup", `serving root report ${rootID}`);
+                }
+              }
+            }
+
+            if (state?.todo?.length) {
               return {
-                content: `No tasks found for session ${sessionID}.`,
+                content: `Tasks for session ${sid}:\n` + fmtTasks(state.todo, state.log || []).join("\n"),
               };
             }
-
-            const lines: string[] = [];
-            for (let i = 0; i < state.todo.length; i++) {
-              const status = state.todo[i].done ? "done" : "not done";
-              const logEntry = state.log.find(
-                (e: any) => e.text === state.todo[i].text,
-              );
-              const instructions = logEntry && logEntry.reason
-                ? logEntry.reason
-                : "No instructions yet";
-              lines.push(
-                `Task ${i + 1}: ${state.todo[i].text} - Status: ${status} - Instructions: ${instructions}`,
-              );
+            if (report?.tasks?.length) {
+              return {
+                content: `Completion report for session ${sid} (${report.completedAt}):\n` + fmtTasks(report.tasks, []).join("\n"),
+              };
             }
-
-            return { content: lines.join("\n") };
+            return {
+              content:
+                `No tasks or completion report for session ${sid}.` +
+                (sid !== "default"
+                  ? " Try omitting sessionID (defaults to the current session) or pass the parent/root sessionID."
+                  : ""),
+            };
           } catch (err: any) {
             sideLog("todo_lookup", `ERROR: ${err.message}`);
             return { content: `Lookup error: ${err.message}` };
@@ -1034,7 +1209,7 @@ export default {
         } catch { /* fail-open: headers still set live per request */ }
 
         // Clear active session tracking after compaction
-        await ctx.storage.delete('lc:activeSession');
+        await storageRemove(ctx, 'lc:activeSession');
         sideLog("compaction", "created deterministic summary (no state)");
       } catch (err: any) {
         sideLog("compaction", `ERROR: ${err.message}`);
@@ -1108,28 +1283,34 @@ export default {
         execute: async (invocation: any) => {
           try {
             let sessionID: string | null = null;
-            if (invocation?.session?.id) sessionID = String(invocation.session.id);
-            else if (invocation?.sessionID) sessionID = String(invocation.sessionID);
+            if (invocation?.sessionID) sessionID = String(invocation.sessionID);
+            else if (invocation?.session?.id) sessionID = String(invocation.session.id);
             else if (invocation?.session?.sessionID) sessionID = String(invocation.session.sessionID);
 
             if (!sessionID) {
               return "Could not determine session ID.";
             }
 
-            // The task text may arrive in different shapes across opencode
-            // versions: a plain `text` field, an `args` object, or a `task`
-            // field. Accept every shape so the command works regardless.
+            // Documented shape: CommandInvocation { sessionID, prompt, delivery }
+            // where prompt is PromptInput { text }. Keep the legacy shapes as
+            // fallbacks so the command still works across opencode versions.
             let text: string | null = null;
-            if (typeof invocation.text === "string" && invocation.text.trim()) {
+            if (typeof invocation?.prompt?.text === "string" && invocation.prompt.text.trim()) {
+              text = invocation.prompt.text.trim();
+            } else if (Array.isArray(invocation?.prompt)) {
+              const joined = invocation.prompt
+                .map((p: any) => String(p?.text || ""))
+                .join(" ")
+                .trim();
+              if (joined) text = joined;
+            } else if (typeof invocation?.text === "string" && invocation.text.trim()) {
               text = invocation.text.trim();
-            } else if (invocation.args && typeof invocation.args.task === "string") {
+            } else if (invocation?.args && typeof invocation.args.task === "string") {
               text = invocation.args.task.trim();
-            } else if (invocation.args && typeof invocation.args.text === "string") {
+            } else if (invocation?.args && typeof invocation.args.text === "string") {
               text = invocation.args.text.trim();
-            } else if (typeof invocation.task === "string" && invocation.task.trim()) {
+            } else if (typeof invocation?.task === "string" && invocation.task.trim()) {
               text = invocation.task.trim();
-            } else if (typeof invocation === "string" && invocation.trim()) {
-              text = invocation.trim();
             }
 
             if (!text) {
@@ -1150,11 +1331,10 @@ export default {
               pendingTaskCount: 0,
             };
 
-            state.todo.push({ text: text.trim(), done: false });
+            state.todo.push({ text: text.trim(), goal: "", done: false });
             state.pendingTaskCount = (state.pendingTaskCount || 0) + 1;
 
             await saveState(ctx, sessionID, state);
-            persistState(sessionID);
 
             return `Task added to session ${sessionID}: "${text.trim()}"`;
           } catch (err: any) {
@@ -1167,7 +1347,6 @@ export default {
 
     // --- debug HTTP server for web UI widget ---
     try {
-        const http = require("node:http");
         const PORT = +(process.env.OPENCODE_CTX_DEBUG_PORT || 8765);
 
         const server = http.createServer(async (req: any, res: any) => {
@@ -1330,7 +1509,6 @@ export default {
               const sideLogPath = "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\local-context.log";
               const aggMap: Record<string, { count: number; totalSaved: number; lastKept: number; lastFolded: number }> = {};
               try {
-                const fs = require("node:fs");
                 if (fs.existsSync(sideLogPath)) {
                   const logContent = fs.readFileSync(sideLogPath, "utf8");
                   const foldLines = logContent.split("\n").filter((l: string) => l.includes("fold session="));
@@ -1407,7 +1585,7 @@ export default {
             const sessionID = key.replace(/^lc:/, "");
 
             // Delete state key
-            await ctx.storage.delete(key);
+            await storageRemove(ctx, key);
 
             // Delete all chunk keys for this session
             let after: string | undefined = undefined;
@@ -1415,7 +1593,7 @@ export default {
               const page = await ctx.storage.scan({ prefix: `lc:${sessionID}:chunk:`, limit: 1000, after });
               if (!page?.entries) break;
               for (const entry of page.entries) {
-                await ctx.storage.delete(entry.key);
+                await storageRemove(ctx, entry.key);
               }
               if (!page.next) break;
               after = page.next;
@@ -1427,7 +1605,7 @@ export default {
               const page = await ctx.storage.scan({ prefix: `lc:${sessionID}:index:`, limit: 1000, after });
               if (!page?.entries) break;
               for (const entry of page.entries) {
-                await ctx.storage.delete(entry.key);
+                await storageRemove(ctx, entry.key);
               }
               if (!page.next) break;
               after = page.next;
@@ -1514,7 +1692,7 @@ export default {
   // Clear active session tracking on plugin shutdown
   cleanup: async (ctx: any) => {
     try {
-      await ctx.storage.delete('lc:activeSession');
+      await storageRemove(ctx, 'lc:activeSession');
     } catch {
       // cleanup must not fail
     }
