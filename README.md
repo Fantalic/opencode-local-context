@@ -11,7 +11,7 @@
 - **Auto-cleanup on completion** - report to storage `lc:report:<sid>` + disk `lc-persist/<sid>.report.json`, then wipe chunks/state/registry; report survives `/clear-history`
 - **`/add-task`** and **`/clear-history`** commands
 - **Tool-output truncation cap** - `CAP_CHARS` (default 9000), ANSI-stripped before check
-- **Optional PolyStrata affinity headers** - `X-Session-Id`, `X-Root-Session`, `X-Agent` (only when requests target the PolyStrata URL)
+- **Optional PolyStrata affinity headers** - `X-Session-Id`, `X-Root-Session`, `X-Agent` (only when requests target the PolyStrata URL) - see [PolyStrata integration](#polystrata-integration)
 
 ## Installation
 
@@ -75,6 +75,14 @@ Task 2: Write README.md [open]
 | `OPENCODE_CTX_DEBUG_PORT` | 8765 | Debug HTTP server port (listens on 127.0.0.1) |
 
 `OPENCODE_CTX_DEBUG_PORT` - debug tool only. Exposes a REST API at `http://127.0.0.1:<port>/api/local-context/state` that returns session states, chunks, and index.
+
+## PolyStrata integration
+
+[PolyStrata](https://github.com/Fantalic/PolyStrata) is a local LLM server that runs large models on a normal PC with an OpenAI-/Anthropic-compatible API and an affinity queue for coding agents.
+
+When OpenCode talks to PolyStrata, the plugin tags every request with `X-Session-Id`, `X-Root-Session`, and `X-Agent`. The affinity queue bundles all requests sharing a root session into one conversation, holds the engine for about 20 seconds after each turn, and lets sub-agent calls run inside that window so they spawn without cold re-prefills stealing the turn. These headers are only sent to the PolyStrata URL; every other provider is untouched.
+
+In the reverse direction, `history_lookup`'s LLM extraction falls back to the PolyStrata server (`OPENCODE_CTX_POLY_URL`, `OPENCODE_CTX_POLY_MODEL`), so recovering folded context runs on the same local model serving the session.
 
 ## How Compression Works
 
