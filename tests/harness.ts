@@ -9,6 +9,7 @@
 // Zero: suppress debug server (binds random port → no collision with 8765)
 // ---------------------------------------------------------------------------
 process.env.OPENCODE_CTX_DEBUG_PORT = "0";
+process.env.OPENCODE_CTX_PROTECTED_TOKENS = "2000";
 
 // ---------------------------------------------------------------------------
 // One: tiny assert helper (counts pass/fail, exits 1 on any failure)
@@ -98,7 +99,7 @@ function makeMockCtx(storage: any): any {
   const sessionHooks: Record<string, any> = {};
   const commands: any[] = [];
 
-  return {
+  const ctx: any = {
     tool: {
       transform(cb: (reg: any) => void): void {
         const reg = {
@@ -117,9 +118,24 @@ function makeMockCtx(storage: any): any {
         sessionHooks[name] = cb;
       },
       get: () => { throw new Error("session.get should not be called in these tests"); },
-      create: () => { throw new Error("session.create should not be called in these tests"); },
-      generate: () => { throw new Error("session.generate should not be called in these tests"); },
-      remove: () => { throw new Error("session.remove should not be called in these tests"); },
+      create: () => {
+        if (ctx.generateResponse) {
+          return { id: "temp_lookup_session" };
+        }
+        throw new Error("session.create should not be called in these tests");
+      },
+      generate: async (params: any) => {
+        if (ctx.generateResponse) {
+          return { text: ctx.generateResponse(params) };
+        }
+        throw new Error("session.generate should not be called in these tests");
+      },
+      remove: async () => {
+        if (ctx.generateResponse) {
+          return;
+        }
+        throw new Error("session.remove should not be called in these tests");
+      },
     },
     command: {
       transform(cb: (editor: any) => void): void {
@@ -138,6 +154,8 @@ function makeMockCtx(storage: any): any {
     sessionHooks,
     commands,
   };
+
+  return ctx;
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +559,174 @@ async function runGroupC(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Five: Group D — fold + keys line + history_lookup
+// ---------------------------------------------------------------------------
+
+async function runGroupD(): Promise<void> {
+  console.log("\n=== Group D: fold + keys line + history_lookup ===\n");
+
+  const { map, storage } = makeStorage();
+  const ctx = makeMockCtx(storage);
+
+  const setup = (await import("../local-context.ts")).default;
+  await setup.setup(ctx);
+
+  const planTool = ctx.toolDefs.find((t: any) => t.name === "todo")!;
+  const lookupTool = ctx.toolDefs.find((t: any) => t.name === "history_lookup")!;
+  const sid = "ses_testD";
+
+  // Build a 3000-char filler containing "wombat_reserve corridor"
+  const fillerBase = "wombat_reserve corridor ";
+  let fillerText = "";
+  while (fillerText.length < 3000) {
+    fillerText += fillerBase;
+  }
+  fillerText = fillerText.slice(0, 3000);
+
+  // Shared helper: creates an assistant message with filler text
+  const assistantMsg = (i: number) => ({
+    role: "assistant" as const,
+    content: "Assistant message number " + i + ": " + fillerText,
+  });
+
+  // ---------- D1: fold + keys line ----------
+  {
+    console.log("\n--- D1: fold triggers, keys line in step-log ---");
+    await planTool.execute(
+      {
+        action: "plan",
+        items: [
+          { text: "D1-1: Plan and execute the wombat task", goal: "Get it done" },
+          { text: "D1-2: Second task", goal: "Also done" },
+        ],
+      },
+      { sessionID: sid },
+    );
+
+    await planTool.execute(
+      {
+        action: "done",
+        done: [1],
+        completionStory:
+          "Planned the wombat task, executed the plan, and verified the output was correct.",
+      },
+      { sessionID: sid },
+    );
+
+    const hookInput = {
+      sessionID: sid,
+      messages: [
+        { role: "system" as const, content: [{ type: "text", text: "You are a helpful assistant." }] },
+        { role: "user" as const, content: [{ type: "text", text: "Anchor task: build the wombat reserve corridor" }] },
+        assistantMsg(1),
+        assistantMsg(2),
+        assistantMsg(3),
+        assistantMsg(4),
+      ],
+    };
+
+    const contextHook = ctx.sessionHooks["context"]!;
+    await contextHook(hookInput);
+
+    // Assert: storage has a chunk key
+    let hasChunk = false;
+    for (const key of map.keys()) {
+      if (key.startsWith("lc:" + sid + ":chunk:")) {
+        hasChunk = true;
+        break;
+      }
+    }
+    assert(hasChunk, "D1: storage has a chunk key for the session");
+
+    // Assert: one ev.messages entry text contains "[FOLDED CONTEXT KEYS]" and "wombat"
+    let hasKeysLine = false;
+    for (const msg of hookInput.messages) {
+      const txt = typeof msg.content === "string" ? msg.content : "";
+      if (msg.content && Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (typeof part.text === "string") {
+            if (part.text.includes("[FOLDED CONTEXT KEYS]") && part.text.includes("wombat")) {
+              hasKeysLine = true;
+              break;
+            }
+          }
+        }
+      }
+      if (hasKeysLine) break;
+    }
+    assert(hasKeysLine, "D1: step-log message contains [FOLDED CONTEXT KEYS] and wombat");
+
+    // Assert: state saved with folded=true
+    const stateRaw = map.get(`lc:${sid}`);
+    const state = JSON.parse(stateRaw!);
+    assert(state.folded === true, "D1: state folded=true after hook");
+  }
+
+  // ---------- D2: plain-word query matches ----------
+  {
+    console.log("\n--- D2: plain-word query matches ----------");
+    ctx.generateResponse = (params: any) => "Here is the answer about the wombat corridor.";
+    const result = await lookupTool.execute(
+      { query: "wombat corridor" },
+      { sessionID: sid },
+    );
+    assert(!result.content.includes("No matching history"),
+      "D2: query 'wombat corridor' does NOT produce no-match response");
+  }
+
+  // ---------- D3: self-healing no-match ----------
+  {
+    console.log("\n--- D3: self-healing no-match ----------");
+    const result = await lookupTool.execute(
+      { query: "zzzqqq unrelated stuff" },
+      { sessionID: sid },
+    );
+    assertContains(result.content, "Available keywords in folded chunks",
+      "D3: no-match response lists available keywords");
+    assertContains(result.content, "wombat_reserve",
+      "D3: available keywords include wombat_reserve");
+  }
+
+  // ---------- D4: between-folds refresh keeps keys line ----------
+  {
+    console.log("\n--- D4: between-folds refresh keeps keys line ----------");
+    const contextHook = ctx.sessionHooks["context"]!;
+    const d4Msgs: any[] = [
+      { role: "system", content: [{ type: "text", text: "You are a helpful assistant." }] },
+      { role: "user", content: [{ type: "text", text: "Anchor task: build the wombat reserve corridor" }] },
+      assistantMsg(1),
+      assistantMsg(2),
+      assistantMsg(3),
+      assistantMsg(4),
+    ];
+    // Store reference to input object so we can check ev.messages after the hook
+    const input = {
+      sessionID: sid,
+      messages: d4Msgs,
+    };
+    await contextHook(input);
+
+    // The hook does `ev.messages = newMessages` which replaces the reference.
+    // Check the updated array from the input object, not d4Msgs.
+    const updatedMsgs = input.messages!;
+    let hasKeysLineAfterRefresh = false;
+    for (let mi = 0; mi < updatedMsgs.length; mi++) {
+      const msg = updatedMsgs[mi];
+      if (msg.content && Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (typeof part.text === "string" && part.text.includes("[FOLDED CONTEXT KEYS]")) {
+            hasKeysLineAfterRefresh = true;
+            break;
+          }
+        }
+      }
+      if (hasKeysLineAfterRefresh) break;
+    }
+    assert(hasKeysLineAfterRefresh, "D4: step-log still contains [FOLDED CONTEXT KEYS] after refresh");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Six: Run all groups
 // ---------------------------------------------------------------------------
 
@@ -549,6 +735,7 @@ async function runGroupC(): Promise<void> {
     await runGroupA();
     await runGroupB();
     await runGroupC();
+    await runGroupD();
   } catch (err: any) {
     console.error(`\nCRASH: ${err.message}\n${err.stack}`);
     process.exit(1);

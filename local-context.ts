@@ -90,6 +90,38 @@ function extractKeywords(text: string): string[] {
   return out.slice(0, 12);
 }
 
+// Query-side keyword extraction: history_lookup queries arrive as natural
+// language, which the code-oriented KEYWORD_RE misses entirely. Run the code
+// regexes first; if they yield fewer than 3 keywords, fill up with plain
+// words (lowercased, stopwords dropped, min 3 chars). Cap at 10.
+const STOPWORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "into", "want",
+  "wanted", "was", "were", "has", "had", "not", "but", "all", "any",
+  "are", "you", "your", "its", "our", "one", "two", "use", "used",
+  "using", "also", "add", "new", "like", "just", "about", "after",
+  "before", "when", "what", "which", "how", "who", "why", "can", "could",
+  "would", "should", "their", "there", "then", "them", "they", "been",
+  "being", "have", "will", "shall", "may", "might", "must", "done",
+  "does", "did", "get", "got", "put", "set", "let", "make", "made",
+  "some", "such", "only", "more", "most", "other", "into", "over",
+  "under", "again", "very", "much", "many", "each", "every", "both",
+]);
+
+function extractQueryKeywords(text: string): string[] {
+  const out = extractKeywords(text);
+  if (out.length >= 3) return out.slice(0, 10);
+  const seen = new Set<string>(out);
+  const words = text.toLowerCase().match(/[a-z][a-z0-9_-]{2,}/g) || [];
+  for (const w of words) {
+    if (out.length >= 10) break;
+    if (w.length >= 3 && !STOPWORDS.has(w) && !seen.has(w)) {
+      seen.add(w);
+      out.push(w);
+    }
+  }
+  return out.slice(0, 10);
+}
+
 // === HELPERS: ANSI strip ===
 
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -116,6 +148,44 @@ function renderChecklist(
     }
   }
   return lines.join("\n");
+}
+
+// One compact line carrying the folded chunks' vocabulary into every turn.
+// Newest keywords first, deduped, capped - about 40 tokens.
+function foldedKeysLine(index: any[]): string {
+  const vocab: string[] = [];
+  const seen = new Set<string>();
+  for (let i = index.length - 1; i >= 0 && vocab.length < 24; i--) {
+    for (const kw of index[i].keywords || []) {
+      if (!seen.has(kw)) {
+        seen.add(kw);
+        vocab.push(kw);
+        if (vocab.length >= 24) break;
+      }
+    }
+  }
+  if (vocab.length === 0) return "";
+  return "\n\n[FOLDED CONTEXT KEYS] query history_lookup with these: " + vocab.join(", ");
+}
+
+// Single renderer for the step-log body - the four call sites below used to
+// duplicate this loop; keep them identical by construction.
+function renderStepLogBody(state: any): string {
+  const logTexts: string[] = [];
+  for (const entry of state.log) {
+    let line = "[" + entry.t + "] " + entry.text;
+    const story = entry.completionStory || entry.reason || "";
+    if (story) {
+      line += "\n    Story: " + story;
+    }
+    logTexts.push(line);
+  }
+  let body = logTexts.join("\n");
+  if (state.summaries && state.summaries.length > 0) {
+    body += "\n\n[SUMMARIES]\n" + state.summaries.map((s: any) => s.text).join("\n\n");
+  }
+  body += foldedKeysLine(state.index || []);
+  return body;
 }
 
 // === HELPERS: Side log ===
@@ -613,18 +683,7 @@ export default {
             }
           }
           if (stepLogIdx >= 0) {
-            const logTexts: string[] = [];
-            for (const entry of state.log) {
-              let line = `[${entry.t}] ${entry.text}`;
-              if (entry.completionStory) {
-                line += `\n    Story: ${entry.completionStory}`;
-              }
-              logTexts.push(line);
-            }
-            let logBody = logTexts.join("\n");
-            if (state.summaries.length > 0) {
-              logBody += "\n\n[SUMMARIES]\n" + state.summaries.map((s: any) => s.text).join("\n\n");
-            }
+            let logBody = renderStepLogBody(state);
             logBody += "\n\n[PENDING TASKS]\n";
             for (let i = 0; i < state.todo.length; i++) {
               const mark = state.todo[i].done ? "[x]" : "[ ]";
@@ -665,19 +724,7 @@ export default {
               }
             }
             if (stepLogIdx >= 0) {
-              const logTexts: string[] = [];
-              for (const entry of state.log) {
-                let line = `[${entry.t}] ${entry.text}`;
-                if (entry.completionStory) {
-                  line += `\n    Story: ${entry.completionStory}`;
-                }
-                logTexts.push(line);
-              }
-              let logBody = logTexts.join("\n");
-              if (state.summaries.length > 0) {
-                logBody += "\n\n[SUMMARIES]\n" + state.summaries.map((s: any) => s.text).join("\n\n");
-              }
-              ev.messages[stepLogIdx].content = [{ type: "text", text: stepLogMarker + "\n\n" + logBody }];
+              ev.messages[stepLogIdx].content = [{ type: "text", text: stepLogMarker + "\n\n" + renderStepLogBody(state) }];
             }
             return;
           }
@@ -792,38 +839,14 @@ export default {
 
         if (existingStepLogIdx >= 0) {
           // Update existing step-log in place
-          const logTexts: string[] = [];
-          for (const entry of state.log) {
-            let line = `[${entry.t}] ${entry.text}`;
-            if (entry.completionStory) {
-              line += `\n    Story: ${entry.completionStory}`;
-            }
-            logTexts.push(line);
-          }
-          let logBody = logTexts.join("\n");
-          if (state.summaries.length > 0) {
-            logBody += "\n\n[SUMMARIES]\n" + state.summaries.map((s: any) => s.text).join("\n\n");
-          }
           const stepLogMsg = ev.messages[existingStepLogIdx];
-          stepLogMsg.content = [{ type: "text", text: stepLogMarker + "\n\n" + logBody }];
+          stepLogMsg.content = [{ type: "text", text: stepLogMarker + "\n\n" + renderStepLogBody(state) }];
           newMessages.push(stepLogMsg);
         } else {
           // Insert new step-log user message
-          const logTexts: string[] = [];
-          for (const entry of state.log) {
-            let line = `[${entry.t}] ${entry.text}`;
-            if (entry.completionStory) {
-              line += `\n    Story: ${entry.completionStory}`;
-            }
-            logTexts.push(line);
-          }
-          let logBody = logTexts.join("\n");
-          if (state.summaries.length > 0) {
-            logBody += "\n\n[SUMMARIES]\n" + state.summaries.map((s: any) => s.text).join("\n\n");
-          }
           newMessages.push({
             role: "user",
-            content: [{ type: "text", text: stepLogMarker + "\n\n" + logBody }],
+            content: [{ type: "text", text: stepLogMarker + "\n\n" + renderStepLogBody(state) }],
           });
         }
 
@@ -877,7 +900,7 @@ export default {
       reg.add({
         name: "history_lookup",
         description:
-          "Search folded context chunks by keyword query. Returns a brief extraction from relevant folded content.",
+          "Search folded context chunks by keyword query. Use 2-4 specific identifiers (file names, CamelCase/snake_case terms, exact feature words) - not whole sentences. The available vocabulary is listed in the step log under [FOLDED CONTEXT KEYS].",
         input: {
           type: "object" as const,
           properties: {
@@ -906,7 +929,7 @@ export default {
               return { content: "No folded history available for this session." };
             }
 
-            const queryKw = extractKeywords(params.query);
+            const queryKw = extractQueryKeywords(params.query);
             const queryLower = params.query.toLowerCase();
 
             // Score index entries by query keyword match
@@ -951,7 +974,27 @@ export default {
             }
 
             if (bestScore === 0) {
-              return { content: `no matching history for: ${params.query}` };
+              // Teach the vocabulary: list what the folded chunks actually
+              // contain so the agent can retry with real identifiers.
+              const vocab: string[] = [];
+              const seenKw = new Set<string>();
+              for (let i = state.index.length - 1; i >= 0 && vocab.length < 24; i--) {
+                for (const kw of state.index[i].keywords || []) {
+                  if (!seenKw.has(kw)) {
+                    seenKw.add(kw);
+                    vocab.push(kw);
+                    if (vocab.length >= 24) break;
+                  }
+                }
+              }
+              return {
+                content:
+                  "No matching history for: " + params.query +
+                  "\nQuery with 2-4 specific identifiers (file names, CamelCase/snake_case terms, exact feature words) - not whole sentences." +
+                  (vocab.length > 0
+                    ? "\nAvailable keywords in folded chunks: " + vocab.join(", ")
+                    : "\nNo keywords indexed yet (nothing has been folded)."),
+              };
             }
 
             const entry = state.index[bestIdx];
