@@ -526,11 +526,10 @@ export default {
               const items = params.items || [];
               for (const item of items) {
                 if (!item || typeof item !== "object" || !item.text || !String(item.text).trim() || !item.goal || !String(item.goal).trim()) {
-                  return {
-                    content:
-                      'Invalid arguments for tool "todo": each plan item must be an object {"text": "...", "goal": "..."}. text = what to do; goal = the outcome that defines done (used later to judge completion). Offending item: ' +
+                  throw new Error(
+                    'Invalid arguments for tool "todo": each plan item must be an object {"text": "...", "goal": "..."}. text = what to do; goal = the outcome that defines done (used later to judge completion). Offending item: ' +
                       JSON.stringify(item),
-                  };
+                  );
                 }
               }
               state.todo = items.map((t: any) => ({ text: String(t.text).trim(), goal: String(t.goal).trim(), done: false }));
@@ -544,16 +543,14 @@ export default {
               // a) completionStory validation
               const story = String(params.completionStory ?? params.reason ?? "").trim();
               if (!story) {
-                return {
-                  content:
-                    'Invalid arguments for tool "todo": completionStory is required for action=done. Describe in past tense HOW the goal was reached (what you did, what was produced, what was verified).',
-                };
+                throw new Error(
+                  'Invalid arguments for tool "todo": completionStory is required for action=done. Describe in past tense HOW the goal was reached (what you did, what was produced, what was verified).',
+                );
               }
               if (story.length < 30) {
-                return {
-                  content:
-                    'Invalid arguments for tool "todo": completionStory must be at least 30 characters. Tell HOW the goal was reached: what was done, what was produced, what was verified.',
-                };
+                throw new Error(
+                  'Invalid arguments for tool "todo": completionStory must be at least 30 characters. Tell HOW the goal was reached: what was done, what was produced, what was verified.',
+                );
               }
 
               // b) Step numbers
@@ -569,19 +566,17 @@ export default {
                 }
               }
               if (rawIdx.length === 0) {
-                return {
-                  content:
-                    'ERROR: no steps were marked done. You must pass the 1-based step numbers in the `done` (or `items`) array.\n\nOpen steps:\n' +
+                throw new Error(
+                  'ERROR: no steps were marked done. You must pass the 1-based step numbers in the `done` (or `items`) array.\n\nOpen steps:\n' +
                     renderChecklist(state.todo.filter(function (t) { return !t.done; })) +
                     '\n\nRule: only mark a step done when its work is completely finished and verified.',
-                };
+                );
               }
               if (rawIdx.length > 0 && validIdx.size === 0) {
-                return {
-                  content:
-                    'No valid step numbers in range 1-' + state.todo.length + '. Received: ' + JSON.stringify(rawIdx) + '.\n\nOpen steps:\n' +
+                throw new Error(
+                  'No valid step numbers in range 1-' + state.todo.length + '. Received: ' + JSON.stringify(rawIdx) + '.\n\nOpen steps:\n' +
                     renderChecklist(state.todo.filter(function (t) { return !t.done; })),
-                };
+                );
               }
 
               // d) Strict order: step N may only be done when all earlier
@@ -595,12 +590,11 @@ export default {
                 if (state.todo[i] && !state.todo[i].done && !validIdx.has(stepNum)) earlierOpen.push(stepNum);
               }
               if (earlierOpen.length > 0 && params.confirm !== true) {
-                return {
-                  content:
-                    "REJECTED: strict step order - step(s) " + earlierOpen.join(", ") +
+                throw new Error(
+                  "REJECTED: strict step order - step(s) " + earlierOpen.join(", ") +
                     " must be done before step " + maxIdx + " can be marked done. Complete them first" +
                     " (in order), or if this out-of-order completion is genuinely intentional, re-call with confirm: true.",
-                };
+                );
               }
 
               // e) Mark tasks done
@@ -642,10 +636,10 @@ export default {
               return { content: renderChecklist(state.todo) + cleanupNote };
             }
 
-            return { content: "Unknown action. Use 'plan' or 'done'." };
+            throw new Error("Unknown action. Use 'plan' or 'done'.");
           } catch (err: any) {
             sideLog("todo", `ERROR: ${err.message}`);
-            return { content: `Error: ${err.message}` };
+            throw err;
           }
         },
       });

@@ -46,6 +46,23 @@ function assertContains(
 }
 
 // ---------------------------------------------------------------------------
+// assert helper variant: expects a thrown error containing a needle string
+// ---------------------------------------------------------------------------
+
+async function expectThrow(
+  fn: () => Promise<any>,
+  needle: string,
+  label: string,
+): Promise<void> {
+  try {
+    await fn();
+    assert(false, label + ": expected a thrown error containing \"" + needle + "\"");
+  } catch (err: any) {
+    assert(String(err?.message || err).includes(needle), label + ": error contains \"" + needle + "\" (got: " + String(err?.message || err).slice(0, 120) + ")");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Two: helpers to build a mock ctx + in-memory storage
 // ---------------------------------------------------------------------------
 
@@ -183,15 +200,25 @@ async function runGroupA(): Promise<void> {
   const lookupTool = ctx.toolDefs.find((t: any) => t.name === "todo_lookup")!;
   const sid = "ses_testA";
 
-  // ---------- A1: plan with plain string → 'each plan item must be an object' ----------
+  // ---------- A1: plan with plain string → throws validation error ----------
   {
     console.log("\n--- A1: plan with plain string item ---");
-    const result = await planTool.execute(
-      { action: "plan", items: ["plain string"] },
-      { sessionID: sid },
+    await expectThrow(
+      () => planTool.execute(
+        { action: "plan", items: ["plain string"] },
+        { sessionID: sid },
+      ),
+      "each plan item must be an object",
+      "A1: error mentions object format",
     );
-    assertContains(result.content, "each plan item must be an object", "A1: error mentions object format");
-    assertContains(result.content, '{"text"', "A1: error shows JSON of offending item");
+    await expectThrow(
+      () => planTool.execute(
+        { action: "plan", items: ["plain string"] },
+        { sessionID: sid },
+      ),
+      '{"text"',
+      "A1: error shows JSON of offending item",
+    );
   }
 
   // ---------- A2: plan with 3 valid tasks → checklist + storage state ----------
@@ -217,21 +244,21 @@ async function runGroupA(): Promise<void> {
     assert(state.todo.length === 3, "A2: state.todo has length 3");
   }
 
-  // ---------- A3: done with valid story, no step numbers → ERROR ----------
+  // ---------- A3: done with valid story, no step numbers → throws ----------
   {
     console.log("\n--- A3: done with valid story, no steps ---");
     // This story is past tense, >30 chars.
-    const result = await planTool.execute(
-      {
-        action: "done",
-        done: [],
-        completionStory:
-          "Implemented the storageRemove helper and verified all delete call sites were replaced via grep.",
-      },
-      { sessionID: sid },
-    );
-    assertContains(
-      result.content,
+    await expectThrow(
+      () =>
+        planTool.execute(
+          {
+            action: "done",
+            done: [],
+            completionStory:
+              "Implemented the storageRemove helper and verified all delete call sites were replaced via grep.",
+          },
+          { sessionID: sid },
+        ),
       "ERROR: no steps were marked done",
       "A3: no-step guard fires",
     );
