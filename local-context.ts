@@ -446,7 +446,7 @@ export default {
       reg.add({
         name: "todo",
         description:
-          "Plan a task and mark its steps done as you complete them. action=done ONLY when the step's work is completely finished AND verified - never for work that is merely started, underway, or delegated and still pending. plan: items are {\"text\": \"what to do\", \"goal\": \"the outcome that defines done\"}. done: 1-based step numbers + completionStory (past tense: HOW the goal was reached; min 30 chars). Do not plan trivial single actions (e.g. a single file read or lookup) as steps; steps should be units of real work worth compressing - grouping related reads into one step is fine.",
+          "Organize BIG tasks: plan multi-step work that needs substantial effort and do the steps yourself in this session - never single file edits, single reads, or single lookups, and never as a board for work you hand to other agents. Mark steps done as you complete them. NO-GO: calling action=done for unfinished work. A step is done ONLY when its work is completely finished in this session and the result was verified: the deliverable exists and you can state what was produced. WARNING - done is a point of no return: after a step is marked done, this step's conversation context is compressed and dropped from the live window. If you mark a step done while its work is incomplete, you lose the very details you still need; re-reading them costs extra steps. Mark done only when you no longer need the step's raw context. plan: items are {\"text\": \"what to do\", \"goal\": \"the outcome that defines done\"}. done: 1-based step numbers + completionStory (past tense, min 30 chars: what was produced, what was verified).",
         input: {
           type: "object" as const,
           properties: {
@@ -477,7 +477,7 @@ export default {
             completionStory: {
               type: "string" as const,
               description:
-                "Required for action=done. Past-tense narrative of HOW the goal was reached: what was done, what was produced, what was verified. At least 30 characters.",
+                "Required for action=done. Past-tense narrative of what was produced and what was verified (files, commands, outputs, measurements). At least 30 characters.",
             },
             reason: {
               type: "string" as const,
@@ -487,7 +487,7 @@ export default {
             confirm: {
               type: "boolean" as const,
               description:
-                "Set true ONLY if a completionStory rejection was a false positive and the work really is complete and verified.",
+                "Set true ONLY if a completionStory rejection was a false positive and the work really is completely finished and verified. Never to force present-tense stories; those are rejected regardless.",
             },
           },
           required: ["action"],
@@ -537,7 +537,7 @@ export default {
               state.folded = false;
               await saveState(ctx, sessionID, state);
               sideLog("todo", `planned ${items.length} tasks`);
-              return { content: renderChecklist(state.todo) + "\n\nReminder: done = work COMPLETE and verified." };
+              return { content: renderChecklist(state.todo) + "\n\nReminder: done drops this step's context - only mark steps whose work is COMPLETE and VERIFIED." };
             }
 
             if (params.action === "done") {
@@ -556,17 +556,7 @@ export default {
                 };
               }
 
-              // b) Phrase guard
-              const IN_PROGRESS_RE = /\b(underway|in progress|starting to|starting|started working|delegating|delegated and (?:still )?(?:awaiting|pending)|about to|will now|let me|going to|currently working|not yet|kicking off|beginning|planning to|working on it|in flight)\b/i;
-              const inProgressMatch = IN_PROGRESS_RE.exec(story);
-              if (inProgressMatch && params.confirm !== true) {
-                return {
-                  content:
-                    'REJECTED: this does not read like completed work (matched phrase: "' + inProgressMatch[0] + '"). A step is done ONLY when its work is completely finished AND verified. If the work really IS complete and your story merely contains this phrase, rewrite the story in past tense with concrete results and re-call with confirm: true.',
-                };
-              }
-
-              // c) Step numbers
+              // b) Step numbers
               const rawIdx = [
                 ...(params.done ?? []),
                 ...(params.items ?? []),

@@ -6,7 +6,7 @@ The local-context plugin compresses conversation context using a todo-list-drive
 
 ## 2. When Compression Happens
 
-**Trigger 1: `pendingFold` set by `todo done`.** After marking steps done in the `todo` tool (line 544), `state.pendingFold` is set to `true`. The next `ctx.session.hook("context")` call detects this flag and triggers a fold. The `todo done` handler runs four validation phases: (a) `completionStory` is required and must be at least 30 characters; (b) a phrase guard rejects stories containing in-progress language (regex: "underway|in progress|starting to|starting|started working|delegating|delegated and (still)?(awaiting|pending)|about to|will now|let me|going to|currently working|not yet|kicking off|beginning|planning to|working on it|in flight") unless `confirm: true` is passed; (c) step numbers must be valid 1-based integers in range 1..state.todo.length; (d) at least one valid step number must be provided.
+**Trigger 1: `pendingFold` set by `todo done`.** After marking steps done in the `todo` tool (line 544), `state.pendingFold` is set to `true`. The next `ctx.session.hook("context")` call detects this flag and triggers a fold. The `todo done` handler runs four validation phases: (a) `completionStory` is required and must be at least 30 characters; (b) step numbers must be valid 1-based integers in range 1..state.todo.length; (c) at least one valid step number must be provided; (d) strict step order (step N may only be done when all earlier steps are done), with `confirm: true` as an escape hatch for out-of-order cases. Story quality is enforced through the tool description (past tense, WHAT was produced, HOW it was verified).
 
 **Trigger 2: Between-folds refresh.** When `state.folded` is `true` but `pendingFold` is `false`, the context hook does not fold again. Instead, it refreshes the step-log message in place (lines 588-614) so the step log stays current without re-folding. This happens on every context hook call for sessions that have already folded. The refresh rebuilds the log body from `state.log` (timestamped entries with completion stories) and appends `[SUMMARIES]` if `state.summaries` is non-empty.
 
@@ -113,7 +113,6 @@ When all tasks are marked done (the `todo done` handler checks `state.todo.every
 - `PERSIST_DIR` = `C:\Users\FakuPara\AppData\Local\Temp\opencode\lc-persist` (line 296)
 - `SIDE_LOG` = `C:\Users\FakuPara\AppData\Local\Temp\opencode\local-context.log` (line 27)
 - `estimateTokens` = `Math.ceil(chars / 4)` (line 32)
-- `IN_PROGRESS_RE` = regex matching 19 phrases (line 489): "underway|in progress|starting to|starting|started working|delegating|delegated and (still)?(awaiting|pending)|about to|will now|let me|going to|currently working|not yet|kicking off|beginning|planning to|working on it|in flight"
 - `KEYWORD_RE` = 4 patterns (lines 67-72): (a) file paths, (b) file extensions (.ts/.js/.py/.md/.json/.yaml/.yml/.ps1/.toml/.txt/.log), (c) PascalCase (min 3 chars after first), (d) snake_case
 - `ANSI_RE` = `\x1b\[[0-9;]*[A-Za-z]` (line 93)
 

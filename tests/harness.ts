@@ -162,12 +162,11 @@ function makeMockCtx(storage: any): any {
 // Three: Group A — single shared mock ctx for the full lifecycle
 //   A1: plan with plain string → error
 //   A2: plan with 3 valid tasks → checklist + storage state
-//   A3: done with REJECTED phrase → REJECTED
-//   A4: done with valid story, no steps → ERROR
-//   A5: done steps [1,2] + valid story → [x] marks + state update
-//   A6: done step [3] + valid story → [All tasks complete], report saved, wipe
-//   A7: todo_lookup with sessionID param
-//   A8: todo_lookup via context.sessionID
+//   A3: done with valid story, no steps → ERROR
+//   A4: done steps [1,2] + valid story → [x] marks + state update
+//   A5: done step [3] + valid story → [All tasks complete], report saved, wipe
+//   A6: todo_lookup with sessionID param
+//   A7: todo_lookup via context.sessionID
 // ---------------------------------------------------------------------------
 
 async function runGroupA(): Promise<void> {
@@ -218,32 +217,10 @@ async function runGroupA(): Promise<void> {
     assert(state.todo.length === 3, "A2: state.todo has length 3");
   }
 
-  // ---------- A3: done with REJECTED phrase (underway / delegating) ----------
+  // ---------- A3: done with valid story, no step numbers → ERROR ----------
   {
-    console.log("\n--- A3: done with REJECTED phrase guard ---");
-    const result = await planTool.execute(
-      {
-        action: "done",
-        done: [1],
-        completionStory: "Research phase underway -- delegating to sub-agents now",
-      },
-      { sessionID: sid },
-    );
-    assertContains(result.content, "REJECTED", "A3: REJECTED phrase guard fires");
-    // State should be unchanged (3 tasks, all undone)
-    const stateRaw = map.get(`lc:${sid}`);
-    const state = JSON.parse(stateRaw!);
-    assert(!state.todo[0].done, "A3: task 1 not marked done after rejection");
-  }
-
-  // ---------- A4: done with valid story, no step numbers → ERROR ----------
-  {
-    console.log("\n--- A4: done with valid story, no steps ---");
-    // This story is past tense, >30 chars, and avoids IN_PROGRESS_RE phrases.
-    // IN_PROGRESS_RE phrases: underway, in progress, starting to, starting,
-    //   started working, delegating, delegated and still awaiting/pending,
-    //   about to, will now, let me, going to, currently working, not yet,
-    //   kicking off, beginning, planning to, working on it, in flight
+    console.log("\n--- A3: done with valid story, no steps ---");
+    // This story is past tense, >30 chars.
     const result = await planTool.execute(
       {
         action: "done",
@@ -256,13 +233,13 @@ async function runGroupA(): Promise<void> {
     assertContains(
       result.content,
       "ERROR: no steps were marked done",
-      "A4: no-step guard fires",
+      "A3: no-step guard fires",
     );
   }
 
-  // ---------- A5: done steps [1,2] with valid story → [x] marks ----------
+  // ---------- A4: done steps [1,2] with valid story → [x] marks ----------
   {
-    console.log("\n--- A5: done steps [1,2] with valid story ---");
+    console.log("\n--- A4: done steps [1,2] with valid story ---");
     const result = await planTool.execute(
       {
         action: "done",
@@ -272,29 +249,28 @@ async function runGroupA(): Promise<void> {
       },
       { sessionID: sid },
     );
-    assertContains(result.content, "[x] 1.", "A5: task 1 marked [x]");
-    assertContains(result.content, "[x] 2.", "A5: task 2 marked [x]");
-    assertContains(result.content, "[ ] 3.", "A5: task 3 still [ ]");
+    assertContains(result.content, "[x] 1.", "A4: task 1 marked [x]");
+    assertContains(result.content, "[x] 2.", "A4: task 2 marked [x]");
+    assertContains(result.content, "[ ] 3.", "A4: task 3 still [ ]");
 
     const stateRaw = map.get(`lc:${sid}`);
     const state = JSON.parse(stateRaw!);
-    assert(state.todo[0].done, "A5: task 1 done in state");
-    assert(state.todo[1].done, "A5: task 2 done in state");
-    assert(!state.todo[2].done, "A5: task 3 not done in state");
+    assert(state.todo[0].done, "A4: task 1 done in state");
+    assert(state.todo[1].done, "A4: task 2 done in state");
+    assert(!state.todo[2].done, "A4: task 3 not done in state");
     assert(
       typeof state.todo[0].completionStory === "string" && state.todo[0].completionStory.length > 0,
-      "A5: task 1 has completionStory set",
+      "A4: task 1 has completionStory set",
     );
     assert(
       typeof state.todo[1].completionStory === "string" && state.todo[1].completionStory.length > 0,
-      "A5: task 2 has completionStory set",
+      "A4: task 2 has completionStory set",
     );
   }
 
-  // ---------- A6: done step [3] with valid story → [All tasks complete] ----------
+  // ---------- A5: done step [3] with valid story → [All tasks complete] ----------
   {
-    console.log("\n--- A6: done step [3] → cleanup + report ---");
-    // This story avoids IN_PROGRESS_RE phrases.
+    console.log("\n--- A5: done step [3] → cleanup + report ---");
     const result = await planTool.execute(
       {
         action: "done",
@@ -304,16 +280,16 @@ async function runGroupA(): Promise<void> {
       },
       { sessionID: sid },
     );
-    assertContains(result.content, "[All tasks complete", "A6: completion note in output");
+    assertContains(result.content, "[All tasks complete", "A5: completion note in output");
 
     // Report saved in storage
     const reportRaw = map.get(`lc:report:${sid}`);
-    assert(reportRaw !== undefined, "A6: report key lc:report:sess_testA exists in storage");
+    assert(reportRaw !== undefined, "A5: report key lc:report:sess_testA exists in storage");
     const report = JSON.parse(reportRaw!);
-    assert(report.tasks.length === 3, "A6: report has 3 tasks");
+    assert(report.tasks.length === 3, "A5: report has 3 tasks");
     for (const t of report.tasks) {
       assert(typeof t.completionStory === "string" && t.completionStory.length > 0,
-        `A6: report task "${t.text}" has completionStory`);
+        `A5: report task "${t.text}" has completionStory`);
     }
 
     // Disk file exists under PERSIST_DIR
@@ -321,10 +297,10 @@ async function runGroupA(): Promise<void> {
     const path = await import("node:path");
     const persistDir = "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-persist";
     const diskPath = path.join(persistDir, `${sid}.report.json`);
-    assert(fs.existsSync(diskPath), `A6: disk file exists at ${diskPath}`);
+    assert(fs.existsSync(diskPath), `A5: disk file exists at ${diskPath}`);
 
     // State key gone
-    assert(map.get(`lc:${sid}`) === undefined, "A6: state key lc:sess_testA is GONE");
+    assert(map.get(`lc:${sid}`) === undefined, "A5: state key lc:sess_testA is GONE");
 
     // All chunk keys gone
     let chunkKeyMissing = true;
@@ -334,16 +310,16 @@ async function runGroupA(): Promise<void> {
         break;
       }
     }
-    assert(chunkKeyMissing, "A6: all lc:sess_testA:chunk:* keys are GONE");
+    assert(chunkKeyMissing, "A5: all lc:sess_testA:chunk:* keys are GONE");
 
     // lc:sessions no longer contains sid
     const sessionsRaw = map.get("lc:sessions");
     if (sessionsRaw) {
       const sessions = JSON.parse(sessionsRaw);
-      assert(!sessions.includes(sid), "A6: lc:sessions no longer contains sess_testA");
+      assert(!sessions.includes(sid), "A5: lc:sessions no longer contains sess_testA");
     } else {
       // If sessions list doesn't exist, that's also fine (it was wiped)
-      assert(true, "A6: lc:sessions key does not exist (was wiped)");
+      assert(true, "A5: lc:sessions key does not exist (was wiped)");
     }
 
     // Clean up disk file
@@ -352,9 +328,9 @@ async function runGroupA(): Promise<void> {
     map.delete(`lc:report:${sid}`);
   }
 
-  // ---------- A7: todo_lookup with sessionID param ----------
+  // ---------- A6: todo_lookup with sessionID param ----------
   {
-    console.log("\n--- A7: todo_lookup with sessionID param ---");
+    console.log("\n--- A6: todo_lookup with sessionID param ---");
     // Set the report key directly (no state) so lookup serves the report path.
     // todo_lookup: if state has todo.length, it serves state; otherwise serves report.
     await storage.set(
@@ -372,16 +348,16 @@ async function runGroupA(): Promise<void> {
       { sessionID: sid },
       { sessionID: sid },
     );
-    assertContains(result.content, "Completion report", "A7: lookup serves completion report");
-    assertContains(result.content, "Story:", "A7: lookup shows at least one Story: line");
-    assert(result.content.includes("[done]"), "A7: status should be [done] for completed tasks");
-    assert(!result.content.includes("[open]"), "A7: status should NOT be [open] for completed tasks");
+    assertContains(result.content, "Completion report", "A6: lookup serves completion report");
+    assertContains(result.content, "Story:", "A6: lookup shows at least one Story: line");
+    assert(result.content.includes("[done]"), "A6: status should be [done] for completed tasks");
+    assert(!result.content.includes("[open]"), "A6: status should NOT be [open] for completed tasks");
     map.delete(`lc:report:${sid}`);
   }
 
-  // ---------- A8: todo_lookup via context.sessionID (no param) ----------
+  // ---------- A7: todo_lookup via context.sessionID (no param) ----------
   {
-    console.log("\n--- A8: todo_lookup via context.sessionID ---");
+    console.log("\n--- A7: todo_lookup via context.sessionID ---");
     await storage.set(
       `lc:report:${sid}`,
       JSON.stringify({
@@ -397,8 +373,8 @@ async function runGroupA(): Promise<void> {
       {},
       { sessionID: sid },
     );
-    assertContains(result.content, "Completion report", "A8: lookup via context.sessionID finds report");
-    assertContains(result.content, "Story:", "A8: lookup via context shows Story: line");
+    assertContains(result.content, "Completion report", "A7: lookup via context.sessionID finds report");
+    assertContains(result.content, "Story:", "A7: lookup via context shows Story: line");
     map.delete(`lc:report:${sid}`);
   }
 }
@@ -726,8 +702,9 @@ async function runGroupD(): Promise<void> {
   }
 }
 
+
 // ---------------------------------------------------------------------------
-// Six: Run all groups
+// Seven: Run all groups
 // ---------------------------------------------------------------------------
 
 (async () => {
