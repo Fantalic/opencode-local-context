@@ -279,6 +279,7 @@ async function runGroupA(): Promise<void> {
     assertContains(result.content, "[x] 1.", "A4: task 1 marked [x]");
     assertContains(result.content, "[x] 2.", "A4: task 2 marked [x]");
     assertContains(result.content, "[ ] 3.", "A4: task 3 still [ ]");
+    assertContains(result.content, "Context warning", "A4: done output carries the context-drop warning");
 
     const stateRaw = map.get(`lc:${sid}`);
     const state = JSON.parse(stateRaw!);

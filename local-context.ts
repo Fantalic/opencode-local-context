@@ -598,6 +598,7 @@ export default {
               }
 
               // e) Mark tasks done
+              let markedAny = false;
               for (const idx of validIdx) {
                 const zeroBased = idx - 1;
                 if (!state.todo[zeroBased].done) {
@@ -616,6 +617,7 @@ export default {
                   state.todo[zeroBased].completionStory = story;
                   state.todo[zeroBased].doneAt = hhmm;
                   state.pendingFold = true;
+                  markedAny = true;
                   sideLog("todo", `marked #${idx} done`);
                 }
               }
@@ -633,7 +635,14 @@ export default {
               }
 
               // f) Success output
-              return { content: renderChecklist(state.todo) + cleanupNote };
+              // Every done folds the step's conversation away on the next
+              // turn - re-announce that consequence right here, where it
+              // happens, so the agent sees it each time it marks a step.
+              let contextNote = "";
+              if (markedAny && !cleanupNote) {
+                contextNote = "\n\n[Context warning: this step's conversation will be compressed and dropped from the live window on the next turn. Recover details later with history_lookup - the vocabulary is in the step log under [FOLDED CONTEXT KEYS].]";
+              }
+              return { content: renderChecklist(state.todo) + cleanupNote + contextNote };
             }
 
             throw new Error("Unknown action. Use 'plan' or 'done'.");
