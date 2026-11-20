@@ -669,13 +669,35 @@ async function runGroupD(): Promise<void> {
   // ---------- D2: plain-word query matches ----------
   {
     console.log("\n--- D2: plain-word query matches ----------");
-    ctx.generateResponse = (params: any) => "Here is the answer about the wombat corridor.";
     const result = await lookupTool.execute(
       { query: "wombat corridor" },
       { sessionID: sid },
     );
     assert(!result.content.includes("No matching history"),
       "D2: query 'wombat corridor' does NOT produce no-match response");
+    assert(result.content.includes("written to:"),
+      "D2: output contains 'written to:'");
+    assert(result.content.includes("Lines:"),
+      "D2: output contains 'Lines:'");
+
+    // Extract file path from content (next line after "written to:")
+    const lines = result.content.split("\n");
+    let filePath = "";
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].includes("written to:")) {
+        // Path is on the next line
+        filePath = (lines[i + 1] || "").trim();
+        break;
+      }
+    }
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    assert(fs.existsSync(filePath), "D2: written file exists at extracted path");
+    const fileContent = fs.readFileSync(filePath, "utf8");
+    assert(fileContent.includes("wombat"),
+      "D2: file content contains 'wombat'");
+    // Clean up for test hygiene
+    try { fs.unlinkSync(filePath); } catch { /* fail-open */ }
   }
 
   // ---------- D3: self-healing no-match ----------

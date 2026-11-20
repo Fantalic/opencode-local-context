@@ -65,12 +65,20 @@ The aging happens during every fold, so the step log stays within a bounded size
 
 ## 5. Recovery Paths
 
-**`history_lookup`** (lines 855-1035): Searches folded chunks by keyword. Extracts keywords from the query via `extractKeywords`. Computes document frequency (how many index entries contain each keyword) across all entries for TF-IDF-like weighting: score for each query keyword = `1 / documentFrequency`. Scores each index entry by summing scores for matched query keywords (substring match: `kw.toLowerCase().includes(qw) || qw.includes(kw.toLowerCase())`). The best-scoring index entry's chunk is loaded via `loadChunk`. Extraction then tries three paths:
-1. `ctx.session.generate` on a temporary session (creates "history-lookup" session, runs generate with prompt: "Context: this chunk was archived for todo step <step> at <t>. Answer the query using ONLY these notes. Notes: <chunkText> Query: <query>", aborts after `LOOKUP_TIMEOUT_MS` = 60000ms default, removes temp session)
-2. Direct HTTP POST to `POLY_URL` (default `http://127.0.0.1:8095`) using `POLY_MODEL` (default `qwen3.6-35b-a3b-ud-q3_k_m`), 400-token max (`max_tokens: 400`), same prompt format
-3. Raw chunk head (first 3000 chars) as final fallback, with `[recovered via keywords: <matched>]` annotation
+**`history_lookup`** (lines 855-1035): Searches folded chunks by keyword and returns the matched chunk on disk so the agent reads it itself. Flow:
 
-The result is the LLM's extraction or raw chunk, annotated with matched keywords (top 12).
+1. **Keyword extraction.** Extracts keywords from the query via `extractKeywords` (same 4 regex patterns as chunk indexing).
+2. **Index scoring.** Computes document frequency (how many index entries contain each keyword) across all entries for TF-IDF-like weighting: score per query keyword = `1 / documentFrequency`. Scores each index entry by summing scores for matched query keywords (substring match both directions: `kw.toLowerCase().includes(qw) || qw.includes(kw.toLowerCase())`).
+3. **Best chunk selection.** The best-scoring index entry is selected.
+4. **No-match self-healing.** If the best score is 0 (no keyword matched any index entry), the tool lists up to 24 available keywords from all chunks and appends a querying hint.
+5. **File write.** The matched chunk (up to 40000 chars) is written to a temp file under `LOOKUP_DIR` (`Temp\opencode\lc-lookup`, one file per chunk key, overwritten on repeat lookups).
+6. **Return fields.** The tool returns: chunk key, step text + folded-at time, absolute file path, line count, char count, and keyword line positions (1-based line numbers, first 10 hits per keyword, up to 12 keywords, query-matched keywords listed first). The agent reads the file directly.
+7. **Write-fail degradation.** If the file write fails, the first 3000 chars are returned inline instead.
+8. **Session cleanup.** `wipeSession` deletes the session's lookup files from `LOOKUP_DIR`.
+
+No LLM is involved in the recovery path.
+
+**Future: optional investigate field (not implemented).** A planned optional input field will launch an agent search over the folded history that also works WITHOUT keywords (semantic matching). `POLY_URL` and `POLY_MODEL` are reserved for this future investigate path.
 
 **`todo_lookup`** (lines 1037-1122): Returns task status, goals (open), and completion stories (done). Renders compactly via `fmtTasks`: `Task N: <text> [done/open]`, `Goal: <goal>` for open, `Story: <story>` (capped at 400 chars) for done. Resolution order: (1) `loadState` on current session (returns only if `state.todo.length > 0`), (2) `loadCompletionReport` (storage then disk fallback at `PERSIST_DIR`), (3) `resolveRootSession` for sub-agent case, (4) error message suggesting sessionID override.
 
@@ -102,9 +110,8 @@ When all tasks are marked done (the `todo done` handler checks `state.todo.every
 | `OPENCODE_CTX_CAP_CHARS` | 9000 | Max chars per `execute.after` result before truncation |
 | `OPENCODE_CTX_AGE_BATCH` | 10 | Number of oldest log entries merged into one summary per aging cycle |
 | `OPENCODE_CTX_ONELINER_KEEP` | 6 | Minimum step-log entries to keep un-aged (aging threshold = ONELINER_KEEP + AGE_BATCH = 16) |
-| `OPENCODE_CTX_LOOKUP_TIMEOUT_MS` | 60000 | Timeout for `history_lookup` extraction (abort + HTTP request) |
-| `OPENCODE_CTX_POLY_URL` | `http://127.0.0.1:8095` | Base URL for `history_lookup` HTTP fallback extraction |
-| `OPENCODE_CTX_POLY_MODEL` | `qwen3.6-35b-a3b-ud-q3_k_m` | Model used for `history_lookup` extraction via HTTP |
+| `OPENCODE_CTX_POLY_URL` | `http://127.0.0.1:8095` | Reserved for future optional investigate path (not currently used by `history_lookup`) |
+| `OPENCODE_CTX_POLY_MODEL` | `qwen3.6-35b-a3b-ud-q3_k_m` | Reserved for future optional investigate path (not currently used by `history_lookup`) |
 | `OPENCODE_CTX_HARD_COMPRESS_TOKENS` | 64000 | Hard-compress threshold for stateless sessions (sub-agents, plain sessions) |
 | `OPENCODE_CTX_DEBUG_PORT` | 8765 | Port for the debug HTTP server (listens on 127.0.0.1) |
 
@@ -139,7 +146,7 @@ When all tasks are marked done (the `todo done` handler checks `state.todo.every
 | `loadCompletionReport` | 328-342 | Load report from storage or disk fallback; fail-open |
 | `resolveRootSession` | 344-361 | Walk parent chain via ctx.session.get (max 10 levels) to find root session ID |
 | Context hook | 575-853 | Core folding: protected tail walk, chunking, step-log insertion, aging, message rebuild, fail-open |
-| `history_lookup` tool | 855-1035 | Keyword-search folded chunks with TF-IDF scoring (1/documentFrequency), LLM extraction (generate or HTTP), raw fallback |
+| `history_lookup` tool | 855-1035 | Keyword-search folded chunks with TF-IDF scoring (1/documentFrequency); writes matched chunk to temp file and returns path + metadata for agent read-back; no-match lists up to 24 keywords; write-fail returns inline 3000-char head |
 | `todo_lookup` tool | 1037-1122 | Show task status/goals/stories; fallback chain: live state -> completion report -> root session |
 | `execute.after` hook | 1124-1146 | Truncation cap on tool output (CAP_CHARS = 9000, ANSI-stripped before check) |
 | `compaction` hook | 1148-1197 | Safety net for sessions without todo state; deterministic summary; preserves identity across compaction |

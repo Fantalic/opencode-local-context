@@ -14,7 +14,7 @@ const PROTECTED_TOKENS = +(process.env.OPENCODE_CTX_PROTECTED_TOKENS || 32000);
 const CAP_CHARS = +(process.env.OPENCODE_CTX_CAP_CHARS || 9000);
 const AGE_BATCH = +(process.env.OPENCODE_CTX_AGE_BATCH || 10);
 const ONELINER_KEEP = +(process.env.OPENCODE_CTX_ONELINER_KEEP || 6);
-const LOOKUP_TIMEOUT_MS = +(process.env.OPENCODE_CTX_LOOKUP_TIMEOUT_MS || 60000);
+// Reserved for the future optional investigate path (agent search); see COMPRESSION.md.
 const POLY_URL = process.env.OPENCODE_CTX_POLY_URL || "http://127.0.0.1:8095";
 const POLY_MODEL = process.env.OPENCODE_CTX_POLY_MODEL || "qwen3.6-35b-a3b-ud-q3_k_m";
 const CHUNK_MAX_CHARS = 40000;
@@ -150,22 +150,27 @@ function renderChecklist(
   return lines.join("\n");
 }
 
-// One compact line carrying the folded chunks' vocabulary into every turn.
-// Newest keywords first, deduped, capped - about 40 tokens.
+// The folded-context vocabulary, grouped by chunk, newest first. The agent
+// picks keywords from here and queries history_lookup, which writes the
+// matching chunk to a readable file. Capped to stay ~60 tokens.
 function foldedKeysLine(index: any[]): string {
-  const vocab: string[] = [];
-  const seen = new Set<string>();
-  for (let i = index.length - 1; i >= 0 && vocab.length < 24; i--) {
-    for (const kw of index[i].keywords || []) {
-      if (!seen.has(kw)) {
-        seen.add(kw);
-        vocab.push(kw);
-        if (vocab.length >= 24) break;
-      }
-    }
+  if (!index || index.length === 0) return "";
+  const groups: string[] = [];
+  let used = 0;
+  for (let i = index.length - 1; i >= 0 && groups.length < 4 && used < 20; i--) {
+    const kws = (index[i].keywords || []).slice(0, 6);
+    if (kws.length === 0) continue;
+    const m = String(index[i].chunkKey || "").match(/:chunk:(\d+)$/);
+    const tag = m ? "c" + m[1] : "c?";
+    groups.push(tag + ": " + kws.join(" "));
+    used += kws.length;
   }
-  if (vocab.length === 0) return "";
-  return "\n\n[FOLDED CONTEXT KEYS] query history_lookup with these: " + vocab.join(", ");
+  if (groups.length === 0) return "";
+  const more = index.length > groups.length ? " | older chunks in the index" : "";
+  return (
+    "\n\n[FOLDED CONTEXT KEYS] chunks newest first - query history_lookup with any keyword; it writes the matching chunk to a readable file:\n" +
+    groups.join(" | ") + more
+  );
 }
 
 // Single renderer for the step-log body - the four call sites below used to
@@ -339,6 +344,15 @@ async function wipeSession(ctx: any, sessionID: string): Promise<void> {
         await storageRemove(ctx, entry.key);
       }
     } catch { /* fail-open */ }
+    // Remove this session's lookup files (folded chunks written for reading).
+    try {
+      const prefix = sessionID.replace(/[^A-Za-z0-9_-]/g, "_") + "_chunk_";
+      for (const f of fs.readdirSync(LOOKUP_DIR)) {
+        if (f.startsWith(prefix)) {
+          try { fs.unlinkSync(path.join(LOOKUP_DIR, f)); } catch { /* fail-open */ }
+        }
+      }
+    } catch { /* fail-open: dir may not exist */ }
     // Remove state
     await removeState(ctx, sessionID);
     // Unregister
@@ -366,6 +380,12 @@ async function wipeAllSessions(ctx: any): Promise<void> {
 // (chunks, index, state) is wiped. todo_lookup serves this afterwards.
 const PERSIST_DIR =
   "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-persist";
+
+// Folded chunks are recovered as readable files: the agent reads the chunk
+// itself instead of an LLM summarizing it. One file per chunk key, overwritten
+// on repeat lookups, deleted with the session.
+const LOOKUP_DIR =
+  "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-lookup";
 
 function reportKey(sessionID: string): string {
   return `lc:report:${sessionID}`;
@@ -893,7 +913,7 @@ export default {
       reg.add({
         name: "history_lookup",
         description:
-          "Search folded context chunks by keyword query. Use 2-4 specific identifiers (file names, CamelCase/snake_case terms, exact feature words) - not whole sentences. The available vocabulary is listed in the step log under [FOLDED CONTEXT KEYS].",
+          "Recover folded context: returns the folded chunk that best matches the query as a readable temp file, with line count and keyword line positions - read the file yourself. Query with 2-4 specific identifiers (file names, CamelCase/snake_case terms, exact feature words), not sentences; the vocabulary is in the step log under [FOLDED CONTEXT KEYS].",
         input: {
           type: "object" as const,
           properties: {
@@ -993,95 +1013,54 @@ export default {
             const entry = state.index[bestIdx];
             const chunkText = await loadChunk(ctx, entry.chunkKey);
 
-            // Try to extract via ctx.session.generate on a fresh session
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS);
-
-            let extraction: string | null = null;
-
+            // Deterministic recovery: write the chunk to a file the agent can
+            // read itself. No LLM in the loop. (A future optional "investigate"
+            // field may add an agent search; see COMPRESSION.md.)
+            const chunkNumMatch = entry.chunkKey.match(/:chunk:(\d+)$/);
+            const safeName =
+              sessionID.replace(/[^A-Za-z0-9_-]/g, "_") +
+              "_chunk_" +
+              (chunkNumMatch ? chunkNumMatch[1] : "x") +
+              ".txt";
+            const filePath = path.join(LOOKUP_DIR, safeName);
             try {
-              if (ctx.session?.generate && ctx.session?.create) {
-                sideLog("lookup", "path=generate");
-                let tempID = "";
-                try {
-                  const s = await ctx.session.create({ title: "history-lookup" });
-                  tempID = s?.id ?? s?.sessionID ?? "";
-                  const g = await ctx.session.generate({
-                    sessionID: tempID,
-                    prompt: `${entry.step ? "Context: this chunk was archived for todo step \"" + entry.step + "\" at " + entry.t + ".\n\n" : ""}Answer the query using ONLY these notes. Be brief. Notes:\n${chunkText}\n\nQuery: ${params.query}`,
-                  });
-                  if (g?.text) extraction = g.text;
-                } catch { extraction = null; }
-                finally {
-                  if (tempID) { try { await ctx.session.remove({ sessionID: tempID }); } catch { /* fail-open */ } }
-                }
+              fs.mkdirSync(LOOKUP_DIR, { recursive: true });
+              fs.writeFileSync(filePath, chunkText, "utf8");
+            } catch (err: any) {
+              // Degradation: cannot write the file - inline head instead.
+              sideLog("lookup", "file write failed: " + err.message);
+              return {
+                content:
+                  "Folded chunk " + entry.chunkKey + " could not be written to a file (" + err.message + "). First 3000 chars:\n\n" +
+                  chunkText.slice(0, 3000),
+              };
+            }
+            const lines = chunkText.split("\n");
+            const positionLine = (kw: string): string => {
+              const hits: number[] = [];
+              const needle = kw.toLowerCase();
+              for (let li = 0; li < lines.length && hits.length < 10; li++) {
+                if (lines[li].toLowerCase().includes(needle)) hits.push(li + 1);
               }
-            } catch {
-              extraction = null;
-            } finally {
-              clearTimeout(timeoutId);
+              return "  " + kw + ": " + (hits.length ? hits.join(", ") : "-");
+            };
+            const kwLines: string[] = [];
+            const seenKw = new Set<string>();
+            for (const kw of [...bestMatched, ...(entry.keywords || [])]) {
+              if (seenKw.has(kw) || kwLines.length >= 12) continue;
+              seenKw.add(kw);
+              kwLines.push(positionLine(kw));
             }
-
-            // Fallback: direct POST to POLY_URL
-            if (!extraction) {
-              try {
-                sideLog("lookup", "path=http");
-                const http = await import("node:http");
-                const postData = JSON.stringify({
-                  model: POLY_MODEL,
-                  messages: [
-                    {
-                      role: "user",
-                      content: `${entry.step ? "Context: this chunk was archived for todo step \"" + entry.step + "\" at " + entry.t + ".\n\n" : ""}Answer the query using ONLY these notes. Be brief. Notes:\n${chunkText}\n\nQuery: ${params.query}`,
-                    },
-                  ],
-                  max_tokens: 400,
-                });
-                const url = new URL("/v1/chat/completions", POLY_URL);
-                const opts: any = {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Content-Length": Buffer.byteLength(postData),
-                  },
-                };
-                const req = http.request(url.toString(), opts);
-                req.setTimeout(LOOKUP_TIMEOUT_MS, () => req.destroy(new Error("lookup timeout")));
-                req.write(postData);
-                req.end();
-
-                const respText = await new Promise<string>((resolve, reject) => {
-                  const chunks: string[] = [];
-                  req.on("data", (c: Buffer) => chunks.push(c.toString()));
-                  req.on("end", () => resolve(chunks.join("")));
-                  req.on("error", reject);
-                });
-
-                const json = JSON.parse(respText);
-                const choice = json.choices?.[0];
-                if (choice) {
-                  extraction =
-                    choice.message?.content ??
-                    choice.message?.reasoning_content ??
-                    null;
-                }
-              } catch {
-                extraction = null;
-              }
-            }
-
-            // Final fallback: return raw chunk head
-            if (!extraction) {
-              sideLog("lookup", "path=raw");
-              const head = chunkText.slice(0, 3000);
-              return { content: `${head}\n\n[lookup extraction unavailable; raw chunk head]` };
-            }
-
-            const matchedStr = bestMatched.length > 0
-              ? bestMatched.slice(0, 12).join(", ")
-              : params.query;
-
-            return { content: `${extraction}\n\n[recovered via keywords: ${matchedStr}]` };
+            sideLog("lookup", "path=file, lines=" + lines.length + ", file=" + filePath);
+            return {
+              content:
+                "Folded chunk " + entry.chunkKey +
+                (entry.step ? ' (step: "' + entry.step + '", folded at ' + entry.t + ")" : "") +
+                " written to:\n" + filePath +
+                "\nLines: " + lines.length + ", chars: " + chunkText.length +
+                "\nKeyword positions (1-based line numbers):\n" + kwLines.join("\n") +
+                "\nRead the file to investigate the folded context yourself.",
+            };
           } catch (err: any) {
             sideLog("lookup", `ERROR: ${err.message}`);
             return { content: `Lookup error: ${err.message}` };
@@ -1705,7 +1684,6 @@ export default {
               CAP_CHARS: +(process.env.OPENCODE_CTX_CAP_CHARS || 9000),
               AGE_BATCH: +(process.env.OPENCODE_CTX_AGE_BATCH || 10),
               ONELINER_KEEP: +(process.env.OPENCODE_CTX_ONELINER_KEEP || 6),
-              LOOKUP_TIMEOUT_MS: +(process.env.OPENCODE_CTX_LOOKUP_TIMEOUT_MS || 60000),
               CHUNK_MAX_CHARS: CHUNK_MAX_CHARS,
               POLY_URL: POLY_URL,
               POLY_MODEL: POLY_MODEL,

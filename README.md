@@ -6,7 +6,7 @@
 
 - **`todo` tool** - `plan` items require `{"text","goal"}`; `done` requires 1-based step numbers + past-tense `completionStory` >= 30 chars; phrase guard rejects in-progress language, strict step-order guard - both with `confirm: true` escape hatch; hard errors list open steps; `description` discourages trivial single-action steps
 - **Step-log folding** with protected tail (`OPENCODE_CTX_PROTECTED_TOKENS`, default 32 K tokens); aging merges old log entries into a rolling summary
-- **`history_lookup`** - keyword recovery via TF-IDF scoring on folded chunks, LLM extraction with raw fallback
+- **`history_lookup`** - keyword recovery: TF-IDF scoring on folded chunks; matched chunk written to a readable temp file (line count + keyword line positions returned); no LLM involved
 - **`todo_lookup`** - optional `sessionID`, completion-report fallback, root-session fallback for sub-agents
 - **Auto-cleanup on completion** - report to storage `lc:report:<sid>` + disk `lc-persist/<sid>.report.json`, then wipe chunks/state/registry; report survives `/clear-history`
 - **`/add-task`** and **`/clear-history`** commands
@@ -68,9 +68,8 @@ Task 2: Write README.md [open]
 | `OPENCODE_CTX_CAP_CHARS` | 9000 | Max chars per tool-output before truncation |
 | `OPENCODE_CTX_AGE_BATCH` | 10 | Oldest log entries merged per aging cycle |
 | `OPENCODE_CTX_ONELINER_KEEP` | 6 | Min step-log entries never aged out |
-| `OPENCODE_CTX_LOOKUP_TIMEOUT_MS` | 60000 | Timeout for `history_lookup` extraction |
-| `OPENCODE_CTX_POLY_URL` | `http://127.0.0.1:8095` | Base URL for `history_lookup` HTTP fallback |
-| `OPENCODE_CTX_POLY_MODEL` | `qwen3.6-35b-a3b-ud-q3_k_m` | Model used for HTTP fallback extraction |
+| `OPENCODE_CTX_POLY_URL` | `http://127.0.0.1:8095` | Reserved for future investigate path (not used by `history_lookup`) |
+| `OPENCODE_CTX_POLY_MODEL` | `qwen3.6-35b-a3b-ud-q3_k_m` | Reserved for future investigate path (not used by `history_lookup`) |
 | `OPENCODE_CTX_HARD_COMPRESS_TOKENS` | 64000 | Hard-compress threshold for stateless sessions |
 | `OPENCODE_CTX_DEBUG_PORT` | 8765 | Debug HTTP server port (listens on 127.0.0.1) |
 
