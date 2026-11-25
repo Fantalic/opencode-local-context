@@ -353,6 +353,8 @@ async function wipeSession(ctx: any, sessionID: string): Promise<void> {
         }
       }
     } catch { /* fail-open: dir may not exist */ }
+    // Remove this session's cap files.
+    try { cleanupCapFilesForSession(sessionID); } catch { /* fail-open */ }
     // Remove state
     await removeState(ctx, sessionID);
     // Unregister
@@ -386,6 +388,39 @@ const PERSIST_DIR =
 // on repeat lookups, deleted with the session.
 const LOOKUP_DIR =
   "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-lookup";
+
+// Full tool outputs that exceeded CAP_CHARS are saved here so the agent can inspect them.
+// Cleaned per-session on wipe/clear-history and stale-cleaned on write.
+const CAP_DIR =
+  "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-cap";
+
+function sanitizeSessionForFile(sessionID: string): string {
+  return String(sessionID || "unknown").replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function cleanupCapFilesForSession(sessionID: string): void {
+  try {
+    const prefix = sanitizeSessionForFile(sessionID) + "_";
+    for (const f of fs.readdirSync(CAP_DIR)) {
+      if (f.startsWith(prefix)) {
+        try { fs.unlinkSync(path.join(CAP_DIR, f)); } catch { /* fail-open */ }
+      }
+    }
+  } catch { /* fail-open */ }
+}
+
+function cleanupStaleCapFiles(maxAgeMs = 24 * 60 * 60 * 1000): void {
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(CAP_DIR)) {
+      const fp = path.join(CAP_DIR, f);
+      try {
+        const st = fs.statSync(fp);
+        if (now - st.mtimeMs > maxAgeMs) fs.unlinkSync(fp);
+      } catch { /* fail-open */ }
+    }
+  } catch { /* fail-open */ }
+}
 
 function reportKey(sessionID: string): string {
   return `lc:report:${sessionID}`;
@@ -466,13 +501,13 @@ export default {
       reg.add({
         name: "todo",
         description:
-          "Organize BIG tasks: plan multi-step work that needs substantial effort and do the steps yourself in this session - never single file edits, single reads, or single lookups, and never as a board for work you hand to other agents. Mark steps done as you complete them. NO-GO: calling action=done for unfinished work. A step is done ONLY when its work is completely finished in this session and the result was verified: the deliverable exists and you can state what was produced. WARNING - done is a point of no return: after a step is marked done, this step's conversation context is compressed and dropped from the live window. If you mark a step done while its work is incomplete, you lose the very details you still need; re-reading them costs extra steps. Mark done only when you no longer need the step's raw context. plan: items are {\"text\": \"what to do\", \"goal\": \"the outcome that defines done\"}. done: 1-based step numbers + completionStory (past tense, min 30 chars: what was produced, what was verified).",
+          "Organize BIG tasks: plan multi-step work that needs substantial effort and do the steps yourself in this session - never single file edits, single reads, or single lookups, and never as a board for work you hand to other agents. Mark steps done as you complete them. NO-GO: calling action=done for unfinished work. A step is done ONLY when its work is completely finished in this session and the result was verified: the deliverable exists and you can state what was produced. WARNING - done is a point of no return: after a step is marked done, this step's conversation context is compressed and dropped from the live window. If you mark a step done while its work is incomplete, you lose the very details you still need; re-reading them costs extra steps. Mark done only when you no longer need the step's raw context. plan: items are {\"text\": \"what to do\", \"goal\": \"the outcome that defines done\"}. done: 1-based step numbers + completionStory (past tense, min 30 chars: what was produced, what was verified). show: report current live checklist without modifying it. update: incrementally adapt a live list with set/add/remove/move ops (snapshot-based, preserves done history). Post-compaction recovery via todo action=\"show\" or todo_lookup.",
         input: {
           type: "object" as const,
           properties: {
             action: {
               type: "string" as const,
-              enum: ["plan", "done"],
+              enum: ["plan", "done", "show", "update"],
             },
             items: {
               type: "array" as const,
@@ -508,6 +543,54 @@ export default {
               type: "boolean" as const,
               description:
                 "Set true ONLY if a completionStory rejection was a false positive and the work really is completely finished and verified. Never to force present-tense stories; those are rejected regardless.",
+            },
+            ops: {
+              type: "array" as const,
+              description:
+                "action=update only: snapshot-based operations applied against the original list. Each item: {op, ...fields}.",
+              items: {
+                type: "object",
+                properties: {
+                  op: {
+                    type: "string",
+                    enum: ["set", "add", "remove", "move"],
+                    description:
+                      "Operation type. set: patch text/goal on an existing step. add: insert a new step. remove: delete an open step. move: reposition a surviving step.",
+                  },
+                  index: {
+                    type: "number",
+                    description:
+                      "For set/remove: 1-based original index of the target step.",
+                  },
+                  text: {
+                    type: "string",
+                    description:
+                      "For set (optional, at least one of text/goal required): new step text. For add (required): new step text.",
+                  },
+                  goal: {
+                    type: "string",
+                    description:
+                      "For set (optional, at least one of text/goal required): new step goal. For add (required): new step goal.",
+                  },
+                  before: {
+                    type: "number",
+                    description:
+                      "For add: 1-based original index to insert before. Omit to append after all original items.",
+                  },
+                  from: {
+                    type: "number",
+                    description:
+                      "For move: 1-based original index of the surviving item to move.",
+                  },
+                  to: {
+                    type: "number",
+                    description:
+                      "For move: 1-based position in the current working list (1..M) to move the item to.",
+                  },
+                },
+                required: ["op"],
+                additionalProperties: false,
+              },
             },
           },
           required: ["action"],
@@ -665,7 +748,266 @@ export default {
               return { content: renderChecklist(state.todo) + cleanupNote + contextNote };
             }
 
-            throw new Error("Unknown action. Use 'plan' or 'done'.");
+            if (params.action === "show") {
+              if (state?.todo?.length) {
+                const doneCount = state.todo.filter((t: any) => t.done).length;
+                const total = state.todo.length;
+                const openCount = total - doneCount;
+                return {
+                  content:
+                    `Tasks for session ${sessionID}: ${doneCount}/${total} done, ${openCount} open\n\n` +
+                    renderChecklist(state.todo),
+                };
+              }
+              return {
+                content:
+                  `No active todo list for session ${sessionID}. Use todo_lookup for completed/wiped reports or root-session fallback, or todo action="plan" to create a new list.`,
+              };
+            }
+
+            if (params.action === "update") {
+              // Require live state with todos
+              if (!state?.todo?.length) {
+                throw new Error(
+                  "No active todo list for session ${sessionID}. Completed/wiped sessions are read-only; use todo_lookup for the report or todo action=\"plan\" to start a fresh list.",
+                );
+              }
+
+              // ops must be a non-empty array
+              const ops = params.ops;
+              if (!Array.isArray(ops) || ops.length === 0) {
+                throw new Error(
+                  'Invalid arguments for tool "todo": action=update requires a non-empty ops array. Example: [{op:"set", index:1, text:"..."}].',
+                );
+              }
+
+              // Snapshot-based deterministic application against original list
+              const original = state.todo.map((t: any) => ({ ...t }));
+              const N = original.length;
+
+              // Collect removed original indexes
+              const removedOrigIndexes = new Set<number>();
+
+              // Pre-pass: collect all removed original indexes (order-independent validation).
+              // This ensures removedOrigIndexes is complete before the main validation loop,
+              // so move.from and set checks against removed indexes work regardless of op order.
+              for (const opItem of ops) {
+                if (opItem.op === "remove") {
+                  const idx = opItem.index;
+                  if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 1 || idx > N) {
+                    throw new Error(
+                      `Invalid remove index: ${idx}. Must be 1-based original index in range 1..${N}.`,
+                    );
+                  }
+                  const origItem = original[idx - 1];
+                  if (origItem.done) {
+                    throw new Error(
+                      `Cannot remove done step ${idx} ("${origItem.text}") - completed steps are preserved for history. Only open steps can be removed.`,
+                    );
+                  }
+                  removedOrigIndexes.add(idx);
+                }
+              }
+
+              // Phase 1: Validate all ops
+              for (const opItem of ops) {
+                if (!opItem || typeof opItem !== "object" || !opItem.op) {
+                  throw new Error(
+                    'Invalid arguments for tool "todo": each op must be an object with an "op" field. Offending item: ' +
+                      JSON.stringify(opItem),
+                  );
+                }
+                const opType = opItem.op;
+                if (!["set", "add", "remove", "move"].includes(opType)) {
+                  throw new Error(
+                    `Invalid op type "${opType}". Must be one of: set, add, remove, move.`,
+                  );
+                }
+
+                if (opType === "set") {
+                  const idx = opItem.index;
+                  if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 1 || idx > N) {
+                    throw new Error(
+                      `Invalid set index: ${idx}. Must be 1-based original index in range 1..${N}.`,
+                    );
+                  }
+                  // Reject set if the original index was removed (pre-pass already collected all removals)
+                  if (removedOrigIndexes.has(idx)) {
+                    throw new Error(
+                      `Cannot set step ${idx} (original index) - that step is removed.`,
+                    );
+                  }
+                  // At least text or goal required (if provided, must be non-empty string after trim)
+                  const hasText =
+                    typeof opItem.text === "string" && String(opItem.text).trim().length > 0;
+                  const hasGoal =
+                    typeof opItem.goal === "string" && String(opItem.goal).trim().length > 0;
+                  if (!hasText && !hasGoal) {
+                    throw new Error(
+                      `Invalid set op at index ${idx}: at least one of text or goal must be provided (non-empty string).`,
+                    );
+                  }
+                } else if (opType === "add") {
+                  if (
+                    typeof opItem.text !== "string" ||
+                    !String(opItem.text).trim().length
+                  ) {
+                    throw new Error(
+                      'Invalid add op: "text" must be a non-empty string.',
+                    );
+                  }
+                  if (
+                    typeof opItem.goal !== "string" ||
+                    !String(opItem.goal).trim().length
+                  ) {
+                    throw new Error(
+                      'Invalid add op: "goal" must be a non-empty string.',
+                    );
+                  }
+                  // Validate before if provided
+                  if (opItem.before !== undefined) {
+                    const b = opItem.before;
+                    if (
+                      typeof b !== "number" ||
+                      !Number.isInteger(b) ||
+                      b < 1 ||
+                      b > N
+                    ) {
+                      throw new Error(
+                        `Invalid add before: ${b}. Must be 1-based original index in range 1..${N}, or omitted to append.`,
+                      );
+                    }
+                  }
+                } else if (opType === "remove") {
+                  // Index range and done-check already validated in pre-pass above.
+                  // Re-add to set (idempotent) for completeness.
+                  removedOrigIndexes.add(opItem.index);
+                } else if (opType === "move") {
+                  const from = opItem.from;
+                  if (
+                    typeof from !== "number" ||
+                    !Number.isInteger(from) ||
+                    from < 1 ||
+                    from > N
+                  ) {
+                    throw new Error(
+                      `Invalid move from: ${from}. Must be 1-based original index in range 1..${N}.`,
+                    );
+                  }
+                  // from must reference an item that is not removed
+                  if (removedOrigIndexes.has(from)) {
+                    throw new Error(
+                      `Cannot move step ${from} (original index) - that step is removed.`,
+                    );
+                  }
+                  // to will be validated later at application time
+                }
+              }
+
+              // Phase 2: Build working list with _origIndex
+              const workingList: any[] = original.map((t: any, i: number) => ({
+                ...t,
+                _origIndex: i + 1,
+              }));
+
+              // Phase 3: Apply set ops
+              for (const opItem of ops) {
+                if (opItem.op === "set") {
+                  const found = workingList.find(
+                    (w: any) => w._origIndex === opItem.index,
+                  );
+                  if (!found) {
+                    throw new Error(
+                      `Cannot set step ${opItem.index} (original index) - that step was removed.`,
+                    );
+                  }
+                  if (typeof opItem.text === "string" && String(opItem.text).trim().length > 0) {
+                    found.text = String(opItem.text).trim();
+                  }
+                  if (typeof opItem.goal === "string" && String(opItem.goal).trim().length > 0) {
+                    found.goal = String(opItem.goal).trim();
+                  }
+                  // Preserve done/completionStory/doneAt
+                }
+              }
+
+              // Phase 4: Apply remove ops
+              for (const opItem of ops) {
+                if (opItem.op === "remove") {
+                  const idx = opItem.index;
+                  const pos = workingList.findIndex(
+                    (w: any) => w._origIndex === idx,
+                  );
+                  if (pos >= 0) workingList.splice(pos, 1);
+                }
+              }
+
+              // Phase 5: Apply add ops
+              for (const opItem of ops) {
+                if (opItem.op === "add") {
+                  const newItem: any = {
+                    text: String(opItem.text).trim(),
+                    goal: String(opItem.goal).trim(),
+                    done: false,
+                    _origIndex: -1, // sentinel for new items
+                  };
+                  if (opItem.before !== undefined) {
+                    // Insert before the first surviving item whose original index >= before
+                    const anchorIdx = workingList.findIndex(
+                      (w: any) => w._origIndex === opItem.before,
+                    );
+                    if (anchorIdx >= 0) {
+                      workingList.splice(anchorIdx, 0, newItem);
+                    } else {
+                      workingList.push(newItem);
+                    }
+                  } else {
+                    // Append at end
+                    workingList.push(newItem);
+                  }
+                }
+              }
+
+              // Phase 6: Apply move ops sequentially
+              for (const opItem of ops) {
+                if (opItem.op === "move") {
+                  const fromIdx = workingList.findIndex(
+                    (w: any) => w._origIndex === opItem.from,
+                  );
+                  if (fromIdx < 0) {
+                    throw new Error(
+                      `Cannot move step ${opItem.from} (original index) - not found in working list (may have been removed).`,
+                    );
+                  }
+                  const toPos = opItem.to;
+                  if (typeof toPos !== "number" || !Number.isInteger(toPos) || toPos < 1 || toPos > workingList.length) {
+                    throw new Error(
+                      `Invalid move to: ${toPos}. Must be 1-based position in range 1..${workingList.length} at move time.`,
+                    );
+                  }
+                  // Remove from current position and insert at to-1
+                  const [movedItem] = workingList.splice(fromIdx, 1);
+                  const insertAt = toPos - 1;
+                  // Adjust insertAt if removing was before the target
+                  const adj = fromIdx < insertAt ? insertAt - 1 : insertAt;
+                  workingList.splice(adj, 0, movedItem);
+                }
+              }
+
+              // Save: strip _origIndex from final items
+              state.todo = workingList.map(
+                ({ _origIndex, ...rest }: any) => rest,
+              );
+              await saveState(ctx, sessionID, state);
+              sideLog("todo", `updated: ${ops.length} ops, ${state.todo.length} tasks`);
+              return {
+                content: renderChecklist(state.todo) + "\n\nUpdated todo list. Done steps keep their completion stories; only open steps were removable.",
+              };
+            }
+
+            throw new Error(
+              "Unknown action. Use 'plan', 'done', 'show', or 'update'.",
+            );
           } catch (err: any) {
             sideLog("todo", `ERROR: ${err.message}`);
             throw err;
@@ -1161,19 +1503,57 @@ export default {
       try {
         if (!ev.result?.content) return;
 
-        const marker = ` ...[truncated ${CAP_CHARS} chars`;
+        const toolName = String(ev.tool || ev.name || ev.toolName || ev.input?.tool || "").toLowerCase();
+        // No cap for subagent spawns - the main session needs the full subagent response.
+        if (toolName === "subagent" || toolName === "task") return;
+        // Avoid re-capping when the agent reads a previously saved cap file.
+        if (toolName === "read") {
+          const readPath = String(ev.args?.filePath || ev.args?.path || ev.input?.args?.filePath || ev.input?.args?.path || "");
+          if (readPath) {
+            try {
+              const resolvedRead = path.resolve(readPath);
+              const resolvedCap = path.resolve(CAP_DIR);
+              if (resolvedRead.startsWith(resolvedCap + path.sep)) return;
+            } catch { /* fall through */ }
+          }
+        }
+
+        const sessionID = String(ev.sessionID || ev.input?.sessionID || ev.context?.sessionID || "unknown");
         const truncMarker = " ...[truncated ";
+        let capSeq = 0;
 
         for (const part of ev.result.content) {
-          if (part.type === "text" && typeof part.text === "string") {
-            const cleaned = stripAnsi(part.text);
-            if (cleaned.length > CAP_CHARS && !part.text.includes(truncMarker)) {
-              const head = part.text.slice(0, CAP_CHARS);
-              const removed = part.text.length - CAP_CHARS;
-              part.text = `${head}${truncMarker}${removed} chars - re-read or use history_lookup]`;
-              sideLog("execute.after", `truncated ${removed} chars`);
-            }
+          if (part.type !== "text" || typeof part.text !== "string") continue;
+          if (part.text.includes(truncMarker)) continue;
+          const cleaned = stripAnsi(part.text);
+          if (cleaned.length <= CAP_CHARS) continue;
+
+          // Save full output to temp file for inspection.
+          let filePath = "";
+          try {
+            fs.mkdirSync(CAP_DIR, { recursive: true });
+            cleanupStaleCapFiles();
+            const safeSid = sanitizeSessionForFile(sessionID);
+            const safeTool = String(toolName || "tool").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40) || "tool";
+            const stamp = Date.now().toString(36) + "-" + (++capSeq).toString(36);
+            filePath = path.join(CAP_DIR, `${safeSid}_${stamp}_${safeTool}.txt`);
+            fs.writeFileSync(filePath, part.text, "utf8");
+          } catch (err: any) {
+            sideLog("execute.after", `cap file write failed: ${err.message}`);
+            filePath = "";
           }
+
+          const head = part.text.slice(0, CAP_CHARS);
+          const removed = part.text.length - CAP_CHARS;
+          let msg = `${head}\n\n...[truncated ${removed} chars; total ${part.text.length} chars, showing first ${CAP_CHARS}]`;
+          if (filePath) {
+            msg += `\n[Full output saved to: ${filePath}]`;
+            msg += `\n[To inspect: use the read tool with path="${filePath}" (offset/limit supported for large files).]`;
+          } else {
+            msg += `\n[Full output could not be saved to file; re-run or narrow the request.]`;
+          }
+          part.text = msg;
+          sideLog("execute.after", `truncated ${removed} chars from ${toolName || "unknown"}${filePath ? " -> " + filePath : ""}`);
         }
       } catch (err: any) {
         sideLog("execute.after", `ERROR: ${err.message}`);
@@ -1186,8 +1566,38 @@ export default {
         const sessionID = ev.sessionID;
         const state = await loadState(ctx, sessionID);
 
-        // If state exists (todo tool was used), native lifecycle proceeds
+        // If state exists (todo tool was used), inject live checklist for model summary
         if (state) {
+          if (state.todo && state.todo.length > 0) {
+            const checklist = renderChecklist(state.todo);
+            const total = state.todo.length;
+            const doneCount = state.todo.filter((t: any) => t.done).length;
+            const openCount = total - doneCount;
+
+            const todoMsg =
+              "[TODO STATE - preserve this checklist in the compaction summary]\n\n" +
+              `Tasks for session ${sessionID}: ${doneCount}/${total} done, ${openCount} open\n\n` +
+              checklist +
+              "\n\nCall todo action=\"show\" or todo_lookup to re-inspect after compaction.";
+
+            if (Array.isArray(ev.messages)) {
+              ev.messages.push({
+                role: "user",
+                content: [{ type: "text", text: todoMsg }],
+              });
+            }
+
+            // Preserve session identity mapping (same as no-state branch, idempotent)
+            try {
+              const rootSession = await resolveRootSession(ctx, sessionID);
+              const keep = rootSession || sessionID;
+              await ctx.storage.set(`lc:rootSession:${sessionID}`, keep);
+              await ctx.storage.set(`lc:sessionId:${keep}`, sessionID);
+            } catch { /* fail-open */ }
+
+            sideLog("compaction", "injected todo state into compaction");
+          }
+          // state exists but no todos: keep current behavior (return, no injection)
           return;
         }
 

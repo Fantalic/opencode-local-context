@@ -4,13 +4,15 @@
 
 ## Features
 
-- **`todo` tool** - `plan` items require `{"text","goal"}`; `done` requires 1-based step numbers + past-tense `completionStory` >= 30 chars; phrase guard rejects in-progress language, strict step-order guard - both with `confirm: true` escape hatch; hard errors list open steps; `description` discourages trivial single-action steps
+- **`todo` tool** - `plan` items require `{"text","goal"}`; `done` requires 1-based step numbers + past-tense `completionStory` >= 30 chars; phrase guard rejects in-progress language, strict step-order guard - both with `confirm: true` escape hatch; hard errors list open steps; `description` discourages trivial single-action steps; `show` reports the live checklist without modifying it; `update` applies snapshot-based incremental ops (`set`/`add`/`remove`/`move`) on the original list, preserving done stories (completed/wiped sessions are read-only)
 - **Step-log folding** with protected tail (`OPENCODE_CTX_PROTECTED_TOKENS`, default 32 K tokens); aging merges old log entries into a rolling summary
 - **`history_lookup`** - keyword recovery: TF-IDF scoring on folded chunks; matched chunk written to a readable temp file (line count + keyword line positions returned); no LLM involved
 - **`todo_lookup`** - optional `sessionID`, completion-report fallback, root-session fallback for sub-agents
+- **Compaction injection** - when compaction fires on a session with active todo state, the hook injects a user message containing the live checklist into the compaction transcript so status survives compaction; agent can also call `todo action="show"` or `todo_lookup` to re-inspect after compaction
 - **Auto-cleanup on completion** - report to storage `lc:report:<sid>` + disk `lc-persist/<sid>.report.json`, then wipe chunks/state/registry; report survives `/clear-history`
 - **`/add-task`** and **`/clear-history`** commands
-- **Tool-output truncation cap** - `CAP_CHARS` (default 9000), ANSI-stripped before check
+- **Tool-output truncation cap** - `CAP_CHARS` (default 9000), ANSI-stripped before check. Skips subagent/task spawns and skips re-capping `read` of files inside `lc-cap`; saves full output to a temp file in `lc-cap` and appends an inspection message telling the agent to use the built-in `read` tool with the file path (offset/limit supported).
+- **Cap file cleanup** - Cap files are cleaned per-session on wipe/clear-history and stale-cleaned after 24 hours.
 - **Optional PolyStrata-fork affinity headers** - `X-Session-Id`, `X-Root-Session`, `X-Agent`, sent only when requests target the fork's server (upstream PolyStrata has no affinity queue) - see [PolyStrata integration](#polystrata-integration)
 
 ## Installation
@@ -49,6 +51,24 @@ A step is done ONLY when its work is completely finished AND verified.
 ```
 REJECTED: strict step order - step(s) 1 must be done before step 2 can be marked done.
 ```
+
+**`todo action="show"`** (re-inspect live checklist):
+
+```json
+{ "action": "show" }
+```
+
+**`todo action="update"`** (snapshot-based incremental ops):
+
+```json
+{ "action": "update", "ops": [
+  { "op": "set", "index": 2, "text": "Write README.md and COMPRESSION.md", "goal": "Document the new todo actions" },
+  { "op": "add", "text": "Run tests", "goal": "Verify harness passes", "before": 3 },
+  { "op": "remove", "index": 4 }
+]}
+```
+
+Notes: update is snapshot-based (indexes refer to the original list); done steps keep their completion stories and cannot be removed; completed/wiped sessions are read-only (use `todo action="plan"` to start fresh).
 
 **`todo_lookup` output example:**
 

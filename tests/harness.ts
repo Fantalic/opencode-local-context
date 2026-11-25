@@ -754,6 +754,473 @@ async function runGroupD(): Promise<void> {
 
 
 // ---------------------------------------------------------------------------
+// Six: Group E — todo show + update
+// ---------------------------------------------------------------------------
+
+async function runGroupE(): Promise<void> {
+  console.log("\n=== Group E: todo show + update ===\n");
+
+  const { map, storage } = makeStorage();
+  const ctx = makeMockCtx(storage);
+  const setup = (await import("../local-context.ts")).default;
+  await setup.setup(ctx);
+
+  const todoTool = ctx.toolDefs.find((t: any) => t.name === "todo")!;
+  const sid = "sess_E";
+
+  // ---------- E1: show with no state ----------
+  {
+    console.log("\n--- E1: show with no state ---");
+    const result = await todoTool.execute({ action: "show" }, { sessionID: sid });
+    assertContains(result.content, "No active todo list for session " + sid, "E1: shows 'No active todo list' message");
+    assertContains(result.content, "todo_lookup", "E1: mentions todo_lookup");
+  }
+
+  // ---------- E2: plan then show ----------
+  {
+    console.log("\n--- E2: plan 3 tasks then show ---");
+    await todoTool.execute(
+      {
+        action: "plan",
+        items: [
+          { text: "Task A", goal: "Goal A" },
+          { text: "Task B", goal: "Goal B" },
+          { text: "Task C", goal: "Goal C" },
+        ],
+      },
+      { sessionID: sid },
+    );
+    const result = await todoTool.execute({ action: "show" }, { sessionID: sid });
+    assertContains(result.content, "Tasks for session " + sid + ": 0/3 done, 3 open", "E2: show summary line");
+    assertContains(result.content, "Task A", "E2: contains Task A");
+    assertContains(result.content, "Task B", "E2: contains Task B");
+    assertContains(result.content, "Task C", "E2: contains Task C");
+  }
+
+  // ---------- E3: update set preserves done ----------
+  {
+    console.log("\n--- E3: update set preserves done ---");
+    // Mark task 1 done
+    await todoTool.execute(
+      {
+        action: "done",
+        done: [1],
+        completionStory: "Completed task A by implementing and verifying the expected output.",
+      },
+      { sessionID: sid },
+    );
+    // Update: change task 1 text via set
+    const updateResult = await todoTool.execute(
+      {
+        action: "update",
+        ops: [{ op: "set", index: 1, text: "Task A revised" }],
+      },
+      { sessionID: sid },
+    );
+    assertContains(updateResult.content, "Task A revised", "E3: updated text visible in output");
+    assertContains(updateResult.content, "[x]", "E3: done mark preserved in output");
+    assertContains(updateResult.content, "Done steps keep their completion stories", "E3: done-steps-preserved message");
+
+    // Verify state: task 1 still done, same story, new text
+    const stateRaw = map.get("lc:" + sid);
+    const state = JSON.parse(stateRaw!);
+    assert(state.todo[0].done === true, "E3: task 1 still done in state");
+    assert(
+      state.todo[0].completionStory === "Completed task A by implementing and verifying the expected output.",
+      "E3: task 1 completionStory preserved",
+    );
+    assert(state.todo[0].text === "Task A revised", "E3: task 1 text updated to 'Task A revised'");
+  }
+
+  // ---------- E4: update add/remove/move ----------
+  {
+    console.log("\n--- E4: update add/remove/move ---");
+    // Current state before this op:
+    //   1=Task A revised (done), 2=Task B (open), 3=Task C (open)
+    // remove index 2 → removes Task B (original index 2)
+    // add Task D → appends
+    // move from 3 (Task C) to position 1 → Task C goes to front
+    // Expected final order: Task C, Task A revised, Task B is gone, Task D
+    const updateResult = await todoTool.execute(
+      {
+        action: "update",
+        ops: [
+          { op: "add", text: "Task D", goal: "Goal D" },
+          { op: "remove", index: 2 },
+          { op: "move", from: 3, to: 1 },
+        ],
+      },
+      { sessionID: sid },
+    );
+    // Verify content
+    assertContains(updateResult.content, "Task C", "E4: Task C present in output");
+    assert(!updateResult.content.includes("Task B"), "E4: Task B removed from output");
+    assertContains(updateResult.content, "Task D", "E4: Task D present in output");
+    assertContains(updateResult.content, "Task A revised", "E4: Task A revised still in output");
+
+    // Verify state order via storage
+    const stateRaw = map.get("lc:" + sid);
+    const state = JSON.parse(stateRaw!);
+    assert(state.todo.length === 3, "E4: 3 tasks in state after add/remove/move (3 orig - 1 removed + 1 added)");
+    assert(state.todo[0].text === "Task C", "E4: Task C is first (moved to position 1)");
+    assert(state.todo[1].text === "Task A revised", "E4: Task A revised is second");
+    assert(state.todo[2].text === "Task D", "E4: Task D is third (appended)");
+    assert(state.todo[0].done === false, "E4: Task C is not done");
+    assert(state.todo[1].done === true, "E4: Task A revised is still done");
+  }
+
+  // ---------- E5: update rejects remove-done ----------
+  {
+    console.log("\n--- E5: update rejects remove-done ---");
+    // After E4's add/remove/move, current order: 1=Task C (open), 2=Task A revised (done), 3=Task D (open)
+    // Use index 2 to target the done step (Task A revised)
+    await expectThrow(
+      () =>
+        todoTool.execute(
+          { action: "update", ops: [{ op: "remove", index: 2 }] },
+          { sessionID: sid },
+        ),
+      "Cannot remove done step",
+      "E5: rejects removing done step",
+    );
+  }
+
+  // ---------- E6: update rejects bad index / empty ops / unknown op / no-state ----------
+  {
+    console.log("\n--- E6: update rejects bad index / empty ops / unknown op / no-state ---");
+    // Empty ops
+    await expectThrow(
+      () =>
+        todoTool.execute(
+          { action: "update", ops: [] },
+          { sessionID: sid },
+        ),
+      "non-empty ops array",
+      "E6: rejects empty ops array",
+    );
+    // Unknown op type
+    await expectThrow(
+      () =>
+        todoTool.execute(
+          { action: "update", ops: [{ op: "nope", index: 1 }] },
+          { sessionID: sid },
+        ),
+      "Invalid op type",
+      "E6: rejects unknown op type",
+    );
+    // Bad index (out of range)
+    await expectThrow(
+      () =>
+        todoTool.execute(
+          { action: "update", ops: [{ op: "set", index: 99, text: "x" }] },
+          { sessionID: sid },
+        ),
+      "range 1..",
+      "E6: rejects out-of-range index",
+    );
+    // No state on different session
+    await expectThrow(
+      () =>
+        todoTool.execute(
+          { action: "update", ops: [{ op: "set", index: 1, text: "x" }] },
+          { sessionID: "sess_E_empty" },
+        ),
+      "No active todo list",
+      "E6: rejects update with no state",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Six: Group F — compaction todo injection
+// ---------------------------------------------------------------------------
+
+async function runGroupF(): Promise<void> {
+  console.log("\n=== Group F: compaction todo injection ===\n");
+
+  const { map, storage } = makeStorage();
+  const ctx = makeMockCtx(storage);
+  const setup = (await import("../local-context.ts")).default;
+  await setup.setup(ctx);
+
+  const todoTool = ctx.toolDefs.find((t: any) => t.name === "todo")!;
+  const compactionHook = ctx.sessionHooks["compaction"];
+
+  // ---------- F1: compaction with todo state injects checklist ----------
+  {
+    console.log("\n--- F1: compaction with todo state injects checklist ---");
+    assert(compactionHook !== undefined, "F1: compaction hook exists");
+
+    // Plan 2 tasks
+    await todoTool.execute(
+      {
+        action: "plan",
+        items: [
+          { text: "F1-Task 1", goal: "Goal 1" },
+          { text: "F1-Task 2", goal: "Goal 2" },
+        ],
+      },
+      { sessionID: "sess_F" },
+    );
+
+    const ev: any = {
+      sessionID: "sess_F",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Do the thing" }] },
+        { role: "assistant", content: [{ type: "text", text: "Working on it" }] },
+      ],
+      result: undefined,
+    };
+    await compactionHook(ev);
+
+    assert(ev.result === undefined, "F1: ev.result is undefined (not set by state branch)");
+    assert(ev.messages.length === 3, "F1: 3 messages (original 2 + 1 injected)");
+
+    // Check injected message
+    const injected = ev.messages[2];
+    assert(injected.role === "user", "F1: injected message role is 'user'");
+    const injectedText = injected.content[0].text;
+    assertContains(injectedText, "[TODO STATE - preserve this checklist in the compaction summary]", "F1: TODO STATE header");
+    assertContains(injectedText, "Tasks for session sess_F: 0/2 done, 2 open", "F1: summary line");
+    assertContains(injectedText, "F1-Task 1", "F1: contains Task 1");
+    assertContains(injectedText, "F1-Task 2", "F1: contains Task 2");
+    assertContains(injectedText, 'todo action="show"', "F1: mentions todo action=show");
+    assertContains(injectedText, "todo_lookup", "F1: mentions todo_lookup");
+  }
+
+  // ---------- F2: compaction with no state sets deterministic summary ----------
+  {
+    console.log("\n--- F2: compaction with no state sets summary ---");
+    const { map: map2, storage: storage2 } = makeStorage();
+    const ctx2 = makeMockCtx(storage2);
+    await setup.setup(ctx2);
+
+    const ev: any = {
+      sessionID: "sess_F_none",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Hello there" }] },
+        { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+      ],
+      result: undefined,
+    };
+    const hook2 = ctx2.sessionHooks["compaction"];
+    await hook2(ev);
+
+    assert(ev.result !== undefined, "F2: ev.result is defined (no-state branch sets summary)");
+    assertContains(ev.result.summary, "Hello there", "F2: summary contains user text");
+    assert(ev.messages.length === 2, "F2: no extra message injected (messages length still 2)");
+  }
+
+  // ---------- F3: compaction with state but empty todos does not inject ----------
+  {
+    console.log("\n--- F3: compaction with state but empty todos does not inject ---");
+    const { map: map3, storage: storage3 } = makeStorage();
+    const ctx3 = makeMockCtx(storage3);
+    await setup.setup(ctx3);
+
+    // Save a state with empty todos directly
+    await storage3.set(
+      "lc:sess_F_empty",
+      JSON.stringify({
+        todo: [],
+        log: [],
+        summaries: [],
+        index: [],
+        folded: false,
+        pendingFold: false,
+        chunkCount: 0,
+      }),
+    );
+
+    const ev: any = {
+      sessionID: "sess_F_empty",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Only one message" }] },
+      ],
+      result: undefined,
+    };
+    const hook3 = ctx3.sessionHooks["compaction"];
+    await hook3(ev);
+
+    assert(ev.result === undefined, "F3: ev.result is undefined (state exists but empty todos)");
+    assert(ev.messages.length === 1, "F3: no extra message injected (messages length still 1)");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Seven: Group G — execute.after cap, subagent skip, read recovery, cleanup
+// ---------------------------------------------------------------------------
+
+async function runGroupG(): Promise<void> {
+  console.log("\n=== Group G: execute.after cap, subagent skip, read recovery ===\n");
+
+  const { map, storage } = makeStorage();
+  const ctx = makeMockCtx(storage);
+
+  const setup = (await import("../local-context.ts")).default;
+  await setup.setup(ctx);
+
+  // The execute.after hook should be registered
+  const execAfter = ctx.toolHooks["execute.after"];
+  assert(typeof execAfter === "function", "G0: execute.after hook is registered");
+
+  // ---------- G1: normal tool output over CAP_CHARS gets truncated + cap file created ----------
+  {
+    console.log("\n--- G1: normal tool output over CAP_CHARS gets truncated + cap file created ---");
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const CAP_DIR = "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-cap";
+
+    // Create a string longer than CAP_CHARS (default 9000)
+    const filler = "A".repeat(9000 + 100);
+
+    const ev: any = {
+      sessionID: "ses_testG1",
+      tool: "some_tool",
+      result: { content: [{ type: "text", text: filler }] },
+    };
+
+    await execAfter(ev);
+
+    assert(ev.result.content[0].text.includes("...[truncated"), "G1: truncated marker present");
+    assert(ev.result.content[0].text.includes("Full output saved to:"), "G1: file path message present");
+    assertContains(ev.result.content[0].text, "use the read tool", "G1: read tool hint present");
+
+    // Extract the file path from the message
+    const pathMatch = ev.result.content[0].text.match(/Full output saved to: (C:\\.+\.txt)/);
+    assert(pathMatch !== null, "G1: file path extracted from message");
+
+    const capFilePath = pathMatch![1];
+    assert(fs.existsSync(capFilePath), "G1: cap file exists on disk");
+    assert(capFilePath.startsWith(CAP_DIR), "G1: cap file is inside CAP_DIR");
+    assert(fs.readFileSync(capFilePath, "utf8").length === filler.length, "G1: cap file contains full original output");
+
+    // Cleanup
+    try { fs.unlinkSync(capFilePath); } catch {}
+  }
+
+  // ---------- G2: subagent spawn is NOT truncated ----------
+  {
+    console.log("\n--- G2: subagent spawn is NOT truncated ---");
+    const filler = "B".repeat(9000 + 100);
+
+    // Test with ev.tool === "subagent"
+    const ev1: any = {
+      sessionID: "ses_testG2",
+      tool: "subagent",
+      result: { content: [{ type: "text", text: filler }] },
+    };
+    await execAfter(ev1);
+    assert(ev1.result.content[0].text.length === filler.length, "G2: subagent via ev.tool NOT truncated");
+
+    // Test with ev.toolName === "subagent"
+    const ev2: any = {
+      sessionID: "ses_testG2",
+      toolName: "subagent",
+      result: { content: [{ type: "text", text: filler }] },
+    };
+    await execAfter(ev2);
+    assert(ev2.result.content[0].text.length === filler.length, "G2: subagent via ev.toolName NOT truncated");
+
+    // Test with ev.name === "subagent"
+    const ev3: any = {
+      sessionID: "ses_testG2",
+      name: "subagent",
+      result: { content: [{ type: "text", text: filler }] },
+    };
+    await execAfter(ev3);
+    assert(ev3.result.content[0].text.length === filler.length, "G2: subagent via ev.name NOT truncated");
+
+    // Test with ev.input.tool === "task"
+    const filler2 = "C".repeat(9000 + 100);
+    const ev4: any = {
+      sessionID: "ses_testG2",
+      input: { tool: "task" },
+      result: { content: [{ type: "text", text: filler2 }] },
+    };
+    await execAfter(ev4);
+    assert(ev4.result.content[0].text.length === filler2.length, "G2: task via ev.input.tool NOT truncated");
+  }
+
+  // ---------- G3: cap file readable + read on CAP_DIR is not re-capped ----------
+  {
+    console.log("\n--- G3: cap file readable + read-path skip ---");
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const CAP_DIR = "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-cap";
+
+    // 1. Create a cap file in CAP_DIR, verify it exists and content is readable
+    fs.mkdirSync(CAP_DIR, { recursive: true });
+    const testCapPath = path.join(CAP_DIR, "testG3_capfile.txt");
+    const testCapContent = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n";
+    fs.writeFileSync(testCapPath, testCapContent, "utf8");
+    assert(fs.existsSync(testCapPath), "G3: cap file created on disk");
+    const readBack = fs.readFileSync(testCapPath, "utf8");
+    assert(readBack === testCapContent, "G3: cap file content matches written content (agent can read it)");
+
+    // 2. Simulate execute.after with a `read` tool whose filePath points INSIDE CAP_DIR.
+    //    The hook should NOT truncate (path resolved starts with CAP_DIR).
+    const largeString = "X".repeat(9000 + 500);
+    const evInside: any = {
+      sessionID: "ses_testG3",
+      tool: "read",
+      args: { filePath: testCapPath },
+      result: { content: [{ type: "text", text: largeString }] },
+    };
+    await execAfter(evInside);
+    assert(evInside.result.content[0].text.length === largeString.length, "G3: read on CAP_DIR path NOT truncated");
+
+    // 3. Simulate execute.after with a `read` tool whose filePath is OUTSIDE CAP_DIR.
+    //    The hook SHOULD truncate (normal read behavior).
+    const largeString2 = "Y".repeat(9000 + 500);
+    const evOutside: any = {
+      sessionID: "ses_testG3",
+      tool: "read",
+      args: { filePath: "C:\\some\\other\\file.txt" },
+      result: { content: [{ type: "text", text: largeString2 }] },
+    };
+    await execAfter(evOutside);
+    assert(evOutside.result.content[0].text.includes("...[truncated"), "G3: read outside CAP_DIR IS truncated");
+
+    // Cleanup test files
+    try { fs.unlinkSync(testCapPath); } catch {}
+  }
+
+  // ---------- G4: cleanupCapFilesForSession removes cap files ----------
+  {
+    console.log("\n--- G4: cleanupCapFilesForSession removes cap files ---");
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const CAP_DIR = "C:\\Users\\FakuPara\\AppData\\Local\\Temp\\opencode\\lc-cap";
+
+    // Create cap files with session prefix
+    const prefix = "ses_testCleanup_";
+    const testFile1 = path.join(CAP_DIR, prefix + "abc123_some_tool.txt");
+    const testFile2 = path.join(CAP_DIR, prefix + "def456_another_tool.txt");
+    fs.mkdirSync(CAP_DIR, { recursive: true });
+    fs.writeFileSync(testFile1, "data1", "utf8");
+    fs.writeFileSync(testFile2, "data2", "utf8");
+
+    // Create a file with a different prefix that should NOT be deleted
+    const otherFile = path.join(CAP_DIR, "ses_otherSession_xyz789_tool.txt");
+    fs.writeFileSync(otherFile, "other", "utf8");
+
+    // wipeSession is internal; exercise it through the clear-history command.
+    const clearCmd = ctx.commands.find((c: any) => c.name === "clear-history");
+    assert(clearCmd !== undefined, "G4: clear-history command registered");
+    await clearCmd.execute({ sessionID: "ses_testCleanup" });
+
+    // Check files were cleaned
+    assert(!fs.existsSync(testFile1), "G4: cap file with session prefix removed");
+    assert(!fs.existsSync(testFile2), "G4: second cap file with session prefix removed");
+    assert(fs.existsSync(otherFile), "G4: file with different session prefix preserved");
+
+    try { fs.unlinkSync(otherFile); } catch {}
+  }
+}
+
+
+// ---------------------------------------------------------------------------
 // Seven: Run all groups
 // ---------------------------------------------------------------------------
 
@@ -763,6 +1230,9 @@ async function runGroupD(): Promise<void> {
     await runGroupB();
     await runGroupC();
     await runGroupD();
+    await runGroupE();
+    await runGroupF();
+    await runGroupG();
   } catch (err: any) {
     console.error(`\nCRASH: ${err.message}\n${err.stack}`);
     process.exit(1);
